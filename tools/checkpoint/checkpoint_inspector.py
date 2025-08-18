@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 import re
 import shutil
+from typing import Optional
 
 import click
 import torch
@@ -64,7 +65,8 @@ def cli():
 @cli.command()
 @click.argument("checkpoint_dir", type=click.Path(exists=True))
 @click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
-def inspect(checkpoint_dir, enable_msc):
+@click.option("--not-ignore-param-to-group-meta", is_flag=True, help="Ignore parameter-to-group metadata.")
+def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
     """Inspect a Megatron Core Distributed Checkpoint"""
     ckpt_path = Path(checkpoint_dir)
 
@@ -138,6 +140,8 @@ def inspect(checkpoint_dir, enable_msc):
     ]
     click.echo(" | ".join(stats) + "\n")
 
+    ignore_param_to_group_meta = not not_ignore_param_to_group_meta
+    ignore_param_to_group_meta_count = 0
     for key, value in metadata.state_dict_metadata.items():
         bullet = click.style("►", fg="blue")
         key_styled = click.style(key, fg="green")
@@ -147,11 +151,18 @@ def inspect(checkpoint_dir, enable_msc):
             shape = click.style(f"{tuple(value.size)}", fg="magenta")
             click.echo(f"  {bullet} {key_styled} [{dtype}, shape={shape}]")
         elif isinstance(value, BytesStorageMetadata):
+            if ignore_param_to_group_meta and key.startswith("optimizer.param_to_group_meta."):
+                ignore_param_to_group_meta_count += 1
+                continue
             click.echo(f"  {bullet} {key_styled} {click.style('[BYTES]', fg='yellow')}")
         else:
             click.echo(
                 f"  {bullet} {key_styled} {click.style('[UNKNOWN TYPE]', fg='red')}"
             )
+    if ignore_param_to_group_meta:
+        click.echo(
+            click.style(f"Ignored parameter-to-group metadata: {ignore_param_to_group_meta_count}", fg="yellow")
+        )
 
     # MCore data section
     try:
@@ -271,68 +282,6 @@ def flatten(obj, parent_key="", sep="."):
     return items
 
 
-def handle_swiglu_weights(key: str, value: torch.Tensor, state_dict: dict) -> None:
-    """
-    Handle SwiGLU weights by splitting them into weight_w and weight_v.
-
-    Args:
-        key (str): The original key that contains "mlp.linear_fc1.weight"
-        value (torch.Tensor): The original weight tensor to split
-        state_dict (dict): The state dict to store the split weights
-    """
-    w, v = torch.chunk(value, 2, dim=0)
-    w = w.redistribute(placements=[Shard(0)])
-    v = v.redistribute(placements=[Shard(0)])
-    w_key = key.replace("mlp.linear_fc1.weight", "mlp.linear_fc1.weight_w")
-    v_key = key.replace("mlp.linear_fc1.weight", "mlp.linear_fc1.weight_v")
-    # Store both w and v in the state_dict
-    state_dict[w_key] = w
-    state_dict[v_key] = v
-
-
-def handle_expert_weights(key: str, value: torch.Tensor, state_dict: dict) -> None:
-    """
-    Handle MoE expert weights by splitting them into individual expert weights.
-
-    Args:
-        key (str): The original key that contains "experts.experts.linear_fc1.weight"
-            or "experts.experts.linear_fc2.weight"
-        value (torch.Tensor): The original weight tensor to split
-        state_dict (dict): The state dict to store the split weights
-    """
-    layer_key = key.replace(".experts.experts.", ".experts.")
-    expert_weights = torch.split(value, 1, dim=0)
-    for expert_idx, expert_weight in enumerate(expert_weights):
-        layer_key_parts = layer_key.split(".weight", 1)
-        if len(layer_key_parts) == 1:
-            expert_key = f"{layer_key}{expert_idx}"
-        elif len(layer_key_parts) == 2:
-            expert_key = f"{layer_key_parts[0]}.weight{expert_idx}{layer_key_parts[1]}"
-        else:
-            raise ValueError(f"Unexpected expert layer key: {layer_key}")
-        state_dict[expert_key] = expert_weight
-
-
-def store_layer_value(
-    layer_key: str, layer_value: torch.Tensor, state_dict: dict, swiglu: bool
-) -> None:
-    """
-    Store the layer value with appropriate handling for SwiGLU and MoE.
-    """
-    if swiglu and "mlp.linear_fc1.weight" in layer_key:
-        # Special case for SwiGLU
-        handle_swiglu_weights(layer_key, layer_value, state_dict)
-    elif (
-        "experts.experts.linear_fc1.weight" in layer_key
-        or "experts.experts.linear_fc2.weight" in layer_key
-    ):
-        # Special case for MoE experts
-        handle_expert_weights(layer_key, layer_value, state_dict)
-    else:
-        # General case
-        state_dict[layer_key] = layer_value
-
-
 def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol=4):
     writer = FileSystemWriter(output_dir)
     planner = DefaultSavePlanner()
@@ -433,6 +382,79 @@ def convert_checkpoint(
             gc.collect()
             torch.cuda.empty_cache()
 
+    def split_layers(
+        key: str,
+        value: torch.Tensor,
+        orig_shape: Optional[torch.Size] = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Split layers into separate tensors.
+        """
+        _free_up_some_gpu_memory()
+        layers = {}
+        for i, v in enumerate(split_dtensor(value, 1, dim=0)):
+            v = gather_uneven_dtensor_to_full_tensor(v).reshape(
+                orig_shape[1:] if orig_shape else value.shape[1:]
+            ).redistribute(placements=[Shard(0)])
+
+            layer_key = key.replace(".layers.", f".layers.{i}.")
+            layers[layer_key] = v
+
+        return layers
+
+    def split_expert_weights(
+        key: str,
+        value: torch.Tensor,
+        orig_shape: Optional[torch.Size] = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Split expert weights into separate tensors for each expert.
+        """
+        experts = {}
+        layer_key = key.replace(".experts.experts.", ".experts.")
+        expert_weights = split_dtensor(value, 1, dim=0)
+        for expert_idx, expert_weight in enumerate(expert_weights):
+            layer_key_parts = layer_key.split(".weight", 1)
+            if len(layer_key_parts) == 1:
+                expert_key = f"{layer_key}{expert_idx}"
+            elif len(layer_key_parts) == 2:
+                expert_key = f"{layer_key_parts[0]}.weight{expert_idx}{layer_key_parts[1]}"
+            else:
+                raise ValueError(f"Unexpected expert layer key: {layer_key}")
+            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight).reshape(
+                orig_shape[1:] if orig_shape else value.shape[1:]
+            ).redistribute(placements=[Shard(0)])
+            experts[expert_key] = expert_weight
+        return experts
+
+    def is_swiglu_key(key):
+        return any(re.search(pat, key) for pat in [
+            r"(.*)\.mlp\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.linear_fc1\.bias$",
+            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
+            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+        ])
+
+    def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
+        """
+        Split SwiGLU weights into separate tensors.
+        """
+        value = gather_uneven_dtensor_to_full_tensor(value)
+        swiglu_w_and_v = {}
+        w, v = torch.chunk(value, 2, dim=0)
+        w = w.redistribute(placements=[Shard(0)])
+        v = v.redistribute(placements=[Shard(0)])
+        w_key = re.sub(r'(weight\d*)(.*)', r'\1_w\2', key)
+        v_key = re.sub(r'(weight\d*)(.*)', r'\1_v\2', key)
+        swiglu_w_and_v[w_key] = w
+        swiglu_w_and_v[v_key] = v
+        return swiglu_w_and_v
+
+    def has_layer_index(key: str) -> bool:
+        return bool(re.search(r"layers\.(\d+)\.", key))
+
     while state_dict:
         key, value = state_dict.popitem()
         if torch.distributed.get_rank() == 0:
@@ -444,19 +466,11 @@ def convert_checkpoint(
             # Skip extra states
             continue
 
-        if "optimizer.state.fp32_param" in key:
-            # Skip torch.float32 optimizer states parameters in MoE model
-            continue
-
         if isinstance(value, torch.Tensor):
             if key.startswith("optimizer.state."):
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
-            elif key.startswith("chained_"):
-                # Special handling for chained optimizer state
-                key_list = key.split(".")
-                new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[4:])}.{key_list[3]}"
             else:
                 # Special handling for module parameters
                 new_key = f"{model_weight_prefix}.{key}"
@@ -476,45 +490,26 @@ def convert_checkpoint(
             else:
                 orig_shape = None
 
-            # Handle multi-layer tensors
-            if ".layers." in new_key:
-                _free_up_some_gpu_memory()
-
-                contain_layer_index = re.search(r"layers\.(\d+)\.", new_key)
-                if contain_layer_index:
-                    layer_shape = orig_shape if orig_shape is not None else value.shape
-                    value = value.reshape(layer_shape)
-                    store_layer_value(new_key, value, fsdp_dtensor_state_dict, swiglu)
-
-                else:
-                    n_layer = value.shape[0]
-                    per_layer_values = [
-                        gather_uneven_dtensor_to_full_tensor(v).redistribute(
-                            placements=[Shard(len(v.shape) - 1)]
-                        )
-                        for v in split_dtensor(value, 1, dim=0)
-                    ]
-                    for i in range(n_layer):
-                        layer_shape = orig_shape[1:] if orig_shape is not None else value.shape[1:]
-                        per_layer_values[i] = (
-                            per_layer_values[i]
-                            .reshape(layer_shape)
-                            .redistribute(placements=[Shard(0)])
-                        )
-                        layer_key = new_key.replace(".layers.", f".layers.{i}.")
-                        store_layer_value(
-                            layer_key, per_layer_values[i], fsdp_dtensor_state_dict, swiglu
-                        )
-
+            # Handle multi-layer / experts tensors
+            split_tensors = {}
+            if ".layers." in new_key and not has_layer_index(new_key):
+                split_tensors = split_layers(new_key, value, orig_shape)
+            elif ".experts.experts." in new_key:
+                split_tensors = split_expert_weights(new_key, value, orig_shape)
             else:
-                if orig_shape is not None:
-                    _free_up_some_gpu_memory()
-                    value = (
-                        value.redistribute(placements=[Replicate()])
-                        .reshape(orig_shape)
-                        .redistribute(placements=[Shard(0)])
-                    )
-                    store_layer_value(new_key, value, fsdp_dtensor_state_dict, swiglu)
+                if orig_shape:
+                    value = gather_uneven_dtensor_to_full_tensor(value).reshape(
+                        orig_shape
+                    ).redistribute(placements=[Shard(0)])
+                split_tensors = {new_key: value}
+
+            for key, value in split_tensors.items():
+                if swiglu and is_swiglu_key(key):
+                    swiglu_w_and_v = split_swiglu_weight(key, value)
+                    fsdp_dtensor_state_dict.update(swiglu_w_and_v)
+                else:
+                    # General case
+                    fsdp_dtensor_state_dict[key] = value
         elif key.startswith("rng_state"):
             # Skip RNG states
             continue
@@ -588,11 +583,27 @@ def convert_checkpoint(
         )
         fsdp_dtensor_state_dict[key] = value
 
+    # # Move fp32_param to model weights
+    # for key in list(fsdp_dtensor_state_dict.keys()):
+    #     if key.endswith(".fp32_param"):
+    #         wkey = key[:len(key) - len(".fp32_param")]
+    #         wkey = wkey.replace(optimizer_state_prefix, model_weight_prefix)
+    #         v = gather_uneven_dtensor_to_full_tensor(fsdp_dtensor_state_dict[key])
+    #         wv = gather_uneven_dtensor_to_full_tensor(fsdp_dtensor_state_dict[wkey])
+    #         diff = v.to(torch.bfloat16) - wv
+    #         if torch.distributed.get_rank() == 0:
+    #             print(key, diff)
+    #         fsdp_dtensor_state_dict[wkey] = fsdp_dtensor_state_dict[key]
+    #         del fsdp_dtensor_state_dict[key]
+
     if "checkpoint_version" not in fsdp_dtensor_state_dict:
         fsdp_dtensor_state_dict["checkpoint_version"] = 3.0
 
     # Save modified checkpoint
     save_checkpoint_with_pickle_protocol(fsdp_dtensor_state_dict, output_dir)
+
+    dist.barrier()              # Synchronize all ranks
+    dist.destroy_process_group()
 
 
 @cli.command()
@@ -785,6 +796,80 @@ def modify_state_dict(input_dir, output_dir, op, enable_msc):
     click.echo(
         click.style(
             f"State dict items modified and saved to {output_dir}.", fg="green", bold=True
+        )
+    )
+
+
+def _compare_two_checkpoint(checkpoint_1, checkpoint_2):
+    reader_1 = FileSystemReader(checkpoint_1)
+    metadata_1 = reader_1.read_metadata()
+
+    reader_2 = FileSystemReader(checkpoint_2)
+    metadata_2 = reader_2.read_metadata()
+
+    keys_1 = set(metadata_1.state_dict_metadata.keys())
+    keys_2 = set(metadata_2.state_dict_metadata.keys())
+
+    click.echo(click.style("Comparing checkpoints...", fg="blue"))
+
+    # Compare keys
+    missing_in_1 = keys_2 - keys_1
+    missing_in_2 = keys_1 - keys_2
+    common_keys = keys_1 & keys_2
+
+    click.echo(click.style("Keys missing in checkpoint 1:", fg="red"))
+    for key in missing_in_1:
+        click.echo(click.style(f" - {key}", fg="red"))
+
+    click.echo(click.style("Keys missing in checkpoint 2:", fg="red"))
+    for key in missing_in_2:
+        click.echo(click.style(f" - {key}", fg="red"))
+
+    # Compare common keys
+    click.echo(click.style("Common keys in both checkpoints:", fg="green"))
+    for key in common_keys:
+        meta_1 = metadata_1.state_dict_metadata[key]
+        meta_2 = metadata_2.state_dict_metadata[key]
+
+        if not isinstance(meta_1, TensorStorageMetadata):
+            continue
+
+        if meta_1.size != meta_2.size or meta_1.properties.dtype != meta_2.properties.dtype:
+            click.echo(click.style(f" - {key} (metadata differ) meta_1: {meta_1}, meta_2: {meta_2}", fg="red"))
+        else:
+            value_1 = torch.empty(meta_1.size, dtype=meta_1.properties.dtype)
+            value_2 = value_1.clone()
+
+            dcp.load({key: value_1}, storage_reader=reader_1, planner=DefaultLoadPlanner())
+            dcp.load({key: value_2}, storage_reader=reader_2, planner=DefaultLoadPlanner())
+
+            if not torch.allclose(
+                value_1, value_2, atol=1e-8, rtol=1e-5
+            ):
+                click.echo(click.style(f" - {key} (values differ) value_1: {value_1}, value_2: {value_2}", fg="red"))
+
+
+@cli.command()
+@click.argument("checkpoint_1", type=click.Path(exists=True))
+@click.argument("checkpoint_2", type=click.Path(exists=True))
+@click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
+def compare_two_checkpoint(checkpoint_1, checkpoint_2, enable_msc):
+    """
+    Compare two checkpoints.
+    """
+    init_process_group(f"compare_two_checkpoint from {checkpoint_1} to {checkpoint_2}")
+
+    if not enable_msc:
+        MultiStorageClientFeature.disable()
+
+    _compare_two_checkpoint(
+        Path(checkpoint_1),
+        Path(checkpoint_2),
+    )
+
+    click.echo(
+        click.style(
+            f"Comparison between {checkpoint_1} and {checkpoint_2} completed.", fg="green", bold=True
         )
     )
 

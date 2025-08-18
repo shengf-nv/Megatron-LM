@@ -1287,7 +1287,7 @@ def _get_parameter_groups(
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
 
-    is_expert_parameter = lambda p: not getattr(p, "allreduce", True)
+    is_expert_parameter = lambda n, p: ".experts." in n
 
     # Step 1: Group the parameters according to their execution order and attributes.
     # FSDP unit module parameters are split into multiple parameter sub-groups.
@@ -1301,7 +1301,7 @@ def _get_parameter_groups(
                 if is_float8tensor(param) or meta_device_init_fp8_params.get(name, False)
                 else param.dtype
             ),
-            is_expert_param=is_expert_parameter(param),
+            is_expert_param=is_expert_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
@@ -2163,6 +2163,10 @@ class ParamAndGradBuffer:
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
 
+            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
+                if getattr(old_param, tp_attr, None) is not None:
+                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
+
         for item_id, p in enumerate(self.params):
             if p in param_map:
                 new_p = param_map[p]
@@ -2305,6 +2309,9 @@ class ParamAndGradBuffer:
                             "partition_dim",
                             "partition_stride",
                             "is_embedding_or_output_parameter",
+                            "_mcore_tp",
+                            "_tp_duplicated",
+                            "_tp_partition_dim",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -3443,7 +3450,7 @@ def _get_fsdp_tensor_spec(
     Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
     # Check if the parameter is a DTensor and has more than one shard(TP enabled).
-    if isinstance(param, DTensor) and cast(DTensor, param)._spec.num_shards > 1:
+    if isinstance(param, DTensor):
         # Retrieve original DTensorSpec (for TP).
         dtensor_spec = cast(DTensor, param)._spec
         dtensor_mesh = getattr(dtensor_spec, "mesh", None)
@@ -3612,26 +3619,18 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if getattr(param, "tensor_model_parallel", False):
+    if getattr(param, "tensor_model_parallel", False) and not getattr(param, "_tp_duplicated", False):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
             "is True. Check usage."
         )
 
-        # Validate M-Core TP attributes
-        assert hasattr(
-            param, "partition_dim"
-        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_dim'."
-        assert hasattr(
-            param, "partition_stride"
-        ), "[Megatron-FSDP] tensor_model_parallel param missing 'partition_stride'."
-        assert (
-            param.partition_stride == 1
-        ), "[Megatron-FSDP] Only partition_stride=1 is currently supported for "
-        "tensor_model_parallel."
+        if hasattr(param, "_tp_partition_dim"):
+            tp_dim = param._tp_partition_dim
+        else:
+            tp_dim = param.partition_dim
 
-        tp_dim = param.partition_dim
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
 
         # Adjust shape for global dimension

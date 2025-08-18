@@ -39,6 +39,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.utils import log_single_rank
 
 try:
@@ -95,6 +96,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
 
+        self._fix_tensor_parallel_attributes(module)
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -141,6 +144,43 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
+    def _fix_tensor_parallel_attributes(self, module):
+        is_expert_param = lambda n, p: ".experts." in n
+
+        if parallel_state.get_tensor_model_parallel_group():
+            tp_size = parallel_state.get_tensor_model_parallel_group().size()
+        else:
+            tp_size = 1
+
+        if parallel_state.get_expert_data_parallel_group():
+            expt_tp_size = parallel_state.get_expert_data_parallel_group().size()
+        else:
+            expt_tp_size = 1
+
+        param_to_direct_module = {}
+        for name, m in module.named_modules():
+            for p in m.parameters(recurse=False):
+                param_to_direct_module[p] = (name, m)
+
+        for name, param in module.named_parameters():
+            if is_expert_param(name, param) and expt_tp_size > 1:
+                setattr(param, "_mcore_tp", True)
+                if "linear_fc1.weight" in name:
+                    setattr(param, "_tp_partition_dim", 0)
+                    setattr(param, "partition_dim", 0)
+                elif "linear_fc2.weight" in name:
+                    setattr(param, "_tp_partition_dim", 1)
+                    setattr(param, "partition_dim", 1)
+
+            if not is_expert_param(name, param) and tp_size > 1:
+                m_name, direct_module = param_to_direct_module[param]
+                if isinstance(direct_module, (TELinear,)):
+                    parallel_mode = getattr(direct_module, "parallel_mode", None)
+                    if parallel_mode is None:
+                        print("reset tensor_model_parallel", m_name, name, parallel_mode, direct_module)
+                        setattr(param, "tensor_model_parallel", False)
+                        setattr(param, "_tp_duplicated", True)
+
     def _init_dist_index(self, grad_comm_pgs, model_comm_pgs):
         """
         Initialize the distributed index for the module.
@@ -170,6 +210,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 inter_fsdp_group = None
                 hybrid_fsdp_group = None
                 expt_dp_group = parallel_state.get_expert_data_parallel_group()
+                ep_group = parallel_state.get_expert_model_parallel_group()
         elif grad_comm_pgs is not None and model_comm_pgs is not None:
             tp_group = getattr(model_comm_pgs, 'tp', None)
             if enable_hsdp:
@@ -211,20 +252,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
         else:
             ep_group = parallel_state.get_expert_model_parallel_group()
-            if ep_group is not None and ep_group.size() > 1:
-                expt_mesh = _get_dp_tp_mesh(
-                    expt_dp_group,
-                    expt_tp_group,
-                    ep_size=ep_group.size(),
-                )
-                expt_device_mesh = DeviceMesh.from_group(
-                    [expt_dp_group, expt_tp_group],
-                    device_type="cuda",
-                    mesh=expt_mesh.tolist(),
-                    mesh_dim_names=["dp_cp", "tp"],
-                )
-            else:
-                expt_device_mesh = None
+            expt_mesh = _get_dp_tp_mesh(
+                expt_dp_group,
+                expt_tp_group,
+                ep_size=ep_group.size()
+            )
+            expt_device_mesh = DeviceMesh.from_group(
+                [expt_dp_group, expt_tp_group],
+                device_type="cuda",
+                mesh=expt_mesh.tolist(),
+                mesh_dim_names=["dp_cp", "tp"],
+            )
 
             mesh = _get_dp_tp_mesh(dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
@@ -335,6 +373,10 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
     ]
     assert len(dp_tp_meshes) == 1, (
         f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    )
+    assert len(dp_tp_meshes[0].reshape(-1).tolist()) == dp_cp_group.size() * tp_group.size(), (
+        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
+        f"does not match expected size {dp_cp_group.size() * tp_group.size()}."
     )
 
     return dp_tp_meshes[0]

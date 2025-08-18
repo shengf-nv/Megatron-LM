@@ -13,12 +13,24 @@
 # limitations under the License.
 
 import re
+
 import torch
+import torch.distributed as dist
+from torch.distributed.checkpoint import default_planner
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
         make_fsdp_dtensor,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        gather_uneven_dtensor_to_full_tensor
+    )
+    from torch.distributed import DeviceMesh
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+    from torch.distributed.checkpoint.metadata import (
+        TensorStorageMetadata,
+    )
+    from torch.distributed._tensor import DTensor
 
     HAVE_MEGATRON_FSDP = True
 except ImportError:
@@ -38,7 +50,7 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     ep_size = parallel_state.get_expert_model_parallel_world_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
-    num_local_experts = args.num_experts // ep_size
+    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
     local_expert_start = ep_rank * num_local_experts
     local_expert_end = local_expert_start + num_local_experts
 
@@ -107,25 +119,51 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if not should_keep_expert_key(expert_index):
             replace_expert_index_in_key(key, expert_index, model_state_dict)
 
-    # Process optimizer state param_group dict
-    for key in list(optimizer_state_dict["param_to_group_meta"].keys()):
-        expert_index = get_expert_index_from_key(key)
-        if not should_keep_expert_key(expert_index):
-            replace_expert_index_in_key(
-                key, expert_index, optimizer_state_dict["param_to_group_meta"]
-            )
 
-    try:
-        optimizer_state_dict = optimizer_state_dict["state"]
-    except KeyError:
-        optimizer_state_dict = {}
+def expert_param_local_key(key):
+    """Get the module parameter corresponding to the key."""
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    args = get_args()
 
-    # Process optimizer state dict
-    if len(optimizer_state_dict) != 0:
-        for key in list(optimizer_state_dict.keys()):
-            expert_index = get_expert_index_from_key(key)
-            if not should_keep_expert_key(expert_index):
-                replace_expert_index_in_key(key, expert_index, optimizer_state_dict)
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
+    local_expert_start = ep_rank * num_local_experts
+
+    def get_expert_index_from_key(key):
+        """Extract expert index from various expert key formats.
+
+        Supported formats:
+        - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
+        - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
+
+        Returns:
+            int: Expert index if found, None otherwise.
+        """
+        # GroupedMLP: index is at the end after 'weight'
+        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+            index_str = key.split('weight')[-1]
+            if index_str.isdigit():
+                return int(index_str)
+        # SequentialMLP: index is between 'local_experts.' and next '.'
+        elif 'mlp.experts.local_experts' in key:
+            index_str = key.split('local_experts.')[-1].split('.', 1)[0]
+            if index_str.isdigit():
+                return int(index_str)
+        return None
+
+    expert_index = get_expert_index_from_key(key)
+    if expert_index is not None:
+        new_expert_index = expert_index - local_expert_start
+        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
+        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+            new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
+        # SequentialMLP: index is between 'local_experts.' and next '.'
+        elif 'mlp.experts.local_experts' in key:
+            new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.')
+        key = new_key
+
+    return key
 
 
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
@@ -174,7 +212,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
-            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
+            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param,
         )
         data_size = data.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
@@ -195,8 +233,15 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         # Fake parameters w and v are used to provide the correct parameter
         # shape and Tensor-Parallelism information.
         per_tp_rank_shape = list(data.shape)
-        if getattr(dist_param, "tensor_model_parallel", False):
-            tp_dim = dist_param.partition_dim
+        if getattr(dist_param, "tensor_model_parallel", False) or getattr(dist_param, "_mcore_tp", False):
+            if getattr(dist_param, "_tp_partition_dim", None) is not None:
+                tp_dim = dist_param._tp_partition_dim
+            elif getattr(dist_param, "partition_dim", None) is not None:
+                tp_dim = dist_param.partition_dim
+            else:
+                raise ValueError(
+                    "Tensor model parallel dimension not found"
+                )
             per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
         linear_fc1_meta = torch.empty(*per_tp_rank_shape, device="meta")
         w_meta, v_meta = torch.chunk(linear_fc1_meta, 2, dim=swiglu_shard_axis)
@@ -248,7 +293,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             optimizer_state_dict[f"{key}_w"] = optimizer_state_dict[key].copy()
             optimizer_state_dict[f"{key}_v"] = optimizer_state_dict[key].copy()
             for subkey in ["exp_avg", "exp_avg_sq"]:
-                dist_param = model.get_parameter(key[len("module.") :])
+                dist_param = model.get_parameter(
+                    expert_param_local_key(key[len("module.") :])
+                )
                 weight_w, weight_v = split_swiglu_linear_fc1(
                     optimizer_state_dict[key][subkey], dist_param, swiglu_shard_axis=0
                 )
@@ -297,20 +344,20 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict):
     meta_keys = set(state_dict_metadata.keys())
     load_keys = set(load_state_dict.keys())
 
-    only_in_meta = meta_keys - load_keys
-    only_in_load = load_keys - meta_keys
-    in_both = meta_keys & load_keys
+    only_in_meta = list(meta_keys - load_keys)
+    only_in_load = list(load_keys - meta_keys)
+    in_both = list(meta_keys & load_keys)
 
-    print("Keys only in checkpoint metadata_state_dict:")
-    for k in sorted(only_in_meta):
+    print("Keys only in checkpoint metadata_state_dict(first 100):")
+    for k in sorted(only_in_meta[:100]):
         print(f"  {k}")
 
-    print("\nKeys only in load_state_dict:")
-    for k in sorted(only_in_load):
+    print("\nKeys only in load_state_dict(first 100):")
+    for k in sorted(only_in_load[:100]):
         print(f"  {k}")
 
-    print("\nKeys in both but with different shapes:")
-    for k in sorted(in_both):
+    print("\nKeys in both but with different shapes(first 100):")
+    for k in sorted(in_both[:100]):
         v_meta = state_dict_metadata[k]
         v_load = load_state_dict[k]
         # If tensors, compare shape; else, compare type/values
@@ -318,3 +365,54 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict):
         load_shape = v_load.shape if hasattr(v_load, "shape") else type(v_load)
         if meta_shape != load_shape:
             print(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
+
+
+def validate_loaded_state_dict(state_dict, checkpoint_path):
+    """
+    Validate the loaded state dict against the expected structure and types.
+    """
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    # Initialize reader
+    reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_path)
+    metadata = reader.read_metadata()
+    flat_state_dict = flatten_state_dict(state_dict)
+
+    for key, value in flat_state_dict.items():
+        tensor_metadata = metadata.state_dict_metadata[key]
+
+        if not isinstance(tensor_metadata, TensorStorageMetadata):
+            continue
+        if not isinstance(value, DTensor):
+            load_item_dict = {
+                key: torch.empty_like(value)
+            }
+        else:
+            load_item_dict = {
+                key: torch.distributed.tensor.empty(
+                    tensor_metadata.size,
+                    dtype=tensor_metadata.properties.dtype,
+                    device_mesh=DeviceMesh.from_group(
+                        group=dist.group.WORLD,
+                        device_type="cuda",
+                        mesh=torch.arange(dist.get_world_size()),
+                        mesh_dim_names=("world",),
+                    ),
+                    placements=[Shard(0)],
+                )
+            }
+        torch.distributed.checkpoint.load(
+            load_item_dict, storage_reader=reader, planner=default_planner.DefaultLoadPlanner()
+        )
+        if isinstance(value, DTensor):
+            full_value = gather_uneven_dtensor_to_full_tensor(value)
+            loaded_tensor = load_item_dict[key].redistribute(placements=[Replicate()])
+            assert torch.allclose(
+                loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
+            ), (
+                f"key: {key}; {loaded_tensor} {full_value}"
+            )
+        else:
+            assert torch.allclose(value, load_item_dict[key]), (
+                f"key: {key}; {value} {load_item_dict[key]}"
+            )
