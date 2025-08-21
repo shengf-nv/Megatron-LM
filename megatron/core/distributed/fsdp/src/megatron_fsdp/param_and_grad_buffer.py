@@ -39,6 +39,7 @@ from .utils import (
     FSDPDistributedIndex,
     get_global_memory_buffer,
     is_mcore_tensor_model_parallel,
+    is_mcore_tensor_parallel_duplicated,
     get_mcore_tensor_parallel_partition_dim,
 )
 
@@ -2256,6 +2257,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 elif wbuf:
@@ -2267,6 +2269,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=True,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
                 else:
@@ -2281,6 +2284,7 @@ class ParamAndGradBuffer:
                         is_expert_param=pg.is_expert_param,
                         run_check=True,
                         update_uneven_dtensor_chunk_meta=False,
+                        force_sync_tp_duplicated_param=True,
                     )
                     dist_main_weight[param_name] = dist_param
 
@@ -3547,6 +3551,7 @@ def make_fsdp_dtensor(
     is_expert_param: bool = False,
     run_check: bool = False,
     update_uneven_dtensor_chunk_meta: bool = False,
+    force_sync_tp_duplicated_param: bool = False,
 ):
     """
     Creates a distributed tensor (DTensor) from a local tensor with support for
@@ -3629,14 +3634,30 @@ def make_fsdp_dtensor(
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
-            "is True. Check usage."
+            "is True."
         )
 
-        tp_dim = get_mcore_tensor_parallel_partition_dim(param)
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
-
-        # Adjust shape for global dimension
         if tp_mesh.mesh.numel() > 1:
+            if is_mcore_tensor_parallel_duplicated(param):
+                placements = [Replicate()]
+                if force_sync_tp_duplicated_param and param.numel() > 0:
+                    torch.distributed.broadcast(
+                        param,
+                        src=tp_mesh.mesh.reshape(-1).tolist(),
+                        group=tp_mesh.group,
+                    )
+                elif run_check:
+                    # TODO: Implement consistency check for duplicated TP parameters
+                    pass
+            else:
+                tp_dim = get_mcore_tensor_parallel_partition_dim(param)
+                assert tp_dim is not None, (
+                    "[Megatron-FSDP] Parameter is not tensor model parallel, yet tensor_model_parallel "
+                    "is True."
+                )
+                placements = [Shard(tp_dim)]
+
             global_shape = list(param.shape)
             global_shape[tp_dim] *= tp_mesh.mesh.numel()
 

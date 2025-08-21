@@ -1161,6 +1161,7 @@ def _load_base_checkpoint(
         if rank0:
             return {}, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
+        state_dict = sharded_state_dict
         raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
         raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
         model = state_dict.pop("_model")
@@ -1174,15 +1175,14 @@ def _load_base_checkpoint(
             rank = torch.distributed.get_rank()
             import time as _time
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
-            print_diff_in_state_dicts(state_dict_metadata, sharded_state_dict)
+            print_diff_in_state_dicts(state_dict_metadata, state_dict)
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
-            state_dict=sharded_state_dict,
+            state_dict=state_dict,
             storage_reader=fs_storage_reader,
             planner=planner,
         )
-        state_dict = sharded_state_dict
 
         if raw_optimizer_state_dict is not None:
             state_dict["optimizer"] = raw_optimizer_state_dict

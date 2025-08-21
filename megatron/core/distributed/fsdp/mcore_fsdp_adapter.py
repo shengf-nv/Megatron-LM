@@ -14,6 +14,7 @@
 
 import logging
 from typing import List, Optional
+import random
 
 try:
     import einops
@@ -24,6 +25,7 @@ except ImportError:
 
 import torch
 import torch.distributed as dist
+import numpy as np
 
 try:
     from torch.distributed import DeviceMesh
@@ -41,6 +43,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.utils import log_single_rank
+from megatron.core import tensor_parallel
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
@@ -122,6 +125,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
 
+        self.sync_rng_states_across_tp_group()
+
     def load_state_dict(self, state_dict, strict=True):
         """
         Load the state dictionary into the module.
@@ -146,6 +151,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
     def _fix_tensor_parallel_attributes(self, module):
         is_expert_param = lambda n, p: ".experts." in n
+        is_router_param = lambda n, p: ".router." in n
 
         if parallel_state.get_tensor_model_parallel_group():
             tp_size = parallel_state.get_tensor_model_parallel_group().size()
@@ -176,6 +182,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     parallel_mode = getattr(direct_module, "parallel_mode", None)
                     if parallel_mode is None:
                         setattr(param, "_tp_duplicated", True)
+                elif is_router_param(name, param):
+                    setattr(param, "_tp_duplicated", True)
 
     def _init_dist_index(self, grad_comm_pgs, model_comm_pgs):
         """
@@ -273,6 +281,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 tp_dim="tp",
             )
 
+        self.tp_group = tp_group
+
         return dist_index
 
     def stop_communication(self):
@@ -281,6 +291,25 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
+
+    def sync_rng_states_across_tp_group(self):
+        """
+        Synchronize the tensor parallel random number generator states.
+        """
+        if self.tp_group.size() <= 1:
+            return
+
+        state_dict = _get_rng_state_dict()
+        if self.tp_group.rank() == 0:
+            broadcast_list = [_rng_state_dict()]
+        else:
+            broadcast_list = [None]
+        torch.distributed.broadcast_object_list(
+            broadcast_list,
+            group=self.tp_group,
+            group_src=0,
+        )
+        _load_rng_state_dict(broadcast_list[0])
 
 
 def _get_hsdp_tp_mesh(inter_fsdp_dp_group, dp_cp_group, tp_group):
@@ -390,3 +419,21 @@ def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
         f"{mesh_ranks.tolist()} does not match the group ranks {group_ranks}."
     )
     return sorted(current_ranks[0]) == sorted(group_ranks)
+
+
+def _rng_state_dict():
+    rng_state_dict = {
+        'random_rng_state': random.getstate(),
+        'np_rng_state': np.random.get_state(),
+        'torch_rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state(),
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
+    }
+
+
+def _load_rng_state_dict(rng_state_dict):
+    random.setstate(rng_state_dict['random_rng_state'])
+    np.random.set_state(rng_state_dict['np_rng_state'])
+    torch.set_rng_state(rng_state_dict['torch_rng_state'])
+    torch.cuda.set_rng_state(rng_state_dict['cuda_rng_state'])
+    tensor_parallel.get_cuda_rng_tracker().set_states(rng_state_dict['rng_tracker_states'])
