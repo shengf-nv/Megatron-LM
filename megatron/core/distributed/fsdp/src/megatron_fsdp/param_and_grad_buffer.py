@@ -3638,15 +3638,17 @@ def make_fsdp_dtensor(
         )
 
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
+        global_shape = list(param.shape)
         if tp_mesh.mesh.numel() > 1:
             if is_mcore_tensor_parallel_duplicated(param):
                 placements = [Replicate()]
-                if force_sync_tp_duplicated_param and param.numel() > 0:
-                    torch.distributed.broadcast(
-                        param,
-                        src=tp_mesh.mesh.reshape(-1).tolist(),
-                        group=tp_mesh.group,
-                    )
+                if force_sync_tp_duplicated_param:
+                    if local_tensor.numel() > 0:
+                        torch.distributed.broadcast(
+                            local_tensor,
+                            group=tp_mesh.get_group(),
+                            group_src=0,
+                        )
                 elif run_check:
                     # TODO: Implement consistency check for duplicated TP parameters
                     pass
@@ -3657,15 +3659,13 @@ def make_fsdp_dtensor(
                     "is True."
                 )
                 placements = [Shard(tp_dim)]
-
-            global_shape = list(param.shape)
-            global_shape[tp_dim] *= tp_mesh.mesh.numel()
+                global_shape[tp_dim] *= tp_mesh.mesh.numel()
 
             # Construct TP-sharded DTensor using Megatron-style placement
             param = DTensor.from_local(
-                local_tensor=param,
+                local_tensor=local_tensor,
                 device_mesh=tp_mesh,
-                placements=[Shard(tp_dim)],
+                placements=placements,
                 run_check=run_check,
                 shape=global_shape,
                 stride=torch.empty(global_shape).stride(),

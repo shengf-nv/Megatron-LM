@@ -151,15 +151,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
     def _fix_tensor_parallel_attributes(self, module):
         is_expert_param = lambda n, p: ".experts." in n
-        is_router_param = lambda n, p: ".router." in n
+        is_router_param = lambda n, p: ".router.weight" in n
 
         if parallel_state.get_tensor_model_parallel_group():
             tp_size = parallel_state.get_tensor_model_parallel_group().size()
         else:
             tp_size = 1
 
-        if parallel_state.get_expert_data_parallel_group():
-            expt_tp_size = parallel_state.get_expert_data_parallel_group().size()
+        if parallel_state.get_expert_tensor_parallel_group():
+            expt_tp_size = parallel_state.get_expert_tensor_parallel_group().size()
         else:
             expt_tp_size = 1
 
@@ -181,8 +181,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 if isinstance(direct_module, (TELinear,)):
                     parallel_mode = getattr(direct_module, "parallel_mode", None)
                     if parallel_mode is None:
+                        setattr(param, "_mcore_tp", True)
                         setattr(param, "_tp_duplicated", True)
                 elif is_router_param(name, param):
+                    setattr(param, "_mcore_tp", True)
                     setattr(param, "_tp_duplicated", True)
 
     def _init_dist_index(self, grad_comm_pgs, model_comm_pgs):
@@ -299,9 +301,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if self.tp_group.size() <= 1:
             return
 
-        state_dict = _get_rng_state_dict()
         if self.tp_group.rank() == 0:
-            broadcast_list = [_rng_state_dict()]
+            broadcast_list = [_get_rng_state_dict()]
         else:
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(
@@ -421,7 +422,7 @@ def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
     return sorted(current_ranks[0]) == sorted(group_ranks)
 
 
-def _rng_state_dict():
+def _get_rng_state_dict():
     rng_state_dict = {
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
@@ -429,6 +430,7 @@ def _rng_state_dict():
         'cuda_rng_state': torch.cuda.get_rng_state(),
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
     }
+    return rng_state_dict
 
 
 def _load_rng_state_dict(rng_state_dict):
