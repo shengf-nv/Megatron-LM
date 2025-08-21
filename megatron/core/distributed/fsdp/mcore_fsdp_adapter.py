@@ -167,18 +167,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 setattr(param, "_mcore_tp", True)
                 if "linear_fc1.weight" in name:
                     setattr(param, "_tp_partition_dim", 0)
-                    setattr(param, "partition_dim", 0)
                 elif "linear_fc2.weight" in name:
                     setattr(param, "_tp_partition_dim", 1)
-                    setattr(param, "partition_dim", 1)
 
             if not is_expert_param(name, param) and tp_size > 1:
                 m_name, direct_module = param_to_direct_module[param]
                 if isinstance(direct_module, (TELinear,)):
                     parallel_mode = getattr(direct_module, "parallel_mode", None)
                     if parallel_mode is None:
-                        print("reset tensor_model_parallel", m_name, name, parallel_mode, direct_module)
-                        setattr(param, "tensor_model_parallel", False)
                         setattr(param, "_tp_duplicated", True)
 
     def _init_dist_index(self, grad_comm_pgs, model_comm_pgs):

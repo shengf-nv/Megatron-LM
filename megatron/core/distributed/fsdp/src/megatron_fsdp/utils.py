@@ -924,3 +924,34 @@ def create_updated_function_signature(original_function, **extended_kwargs: dict
 
     # Return the updated function signature.
     return inspect.Signature(params)
+
+
+def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
+    """
+    Check if the given parameter is Megatron-Core tensor model parallel.
+
+    Args:
+        param (torch.Tensor): The parameter to check.
+
+    Returns:
+        bool: True if the parameter is Megatron-Core tensor model parallel, False otherwise.
+    """
+    return getattr(param, "tensor_model_parallel", False) and not getattr(param, "_tp_duplicated", False)
+
+
+def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
+    """
+    Get the partition dimension for a Megatron-Core tensor model parallel parameter.
+
+    Args:
+        param (torch.Tensor): The parameter to check.
+
+    Returns:
+        Optional[int]: The partition dimension if the parameter is Megatron-Core tensor model parallel, None otherwise.
+    """
+    if is_mcore_tensor_model_parallel(param):
+        if hasattr(param, "_tp_partition_dim"):
+            tp_dim = param._tp_partition_dim
+        else:
+            tp_dim = param.partition_dim
+    return None

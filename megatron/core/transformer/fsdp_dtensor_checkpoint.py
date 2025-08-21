@@ -23,7 +23,11 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        gather_uneven_dtensor_to_full_tensor
+        gather_uneven_dtensor_to_full_tensor,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+        is_mcore_tensor_model_parallel,
+        get_mcore_tensor_parallel_partition_dim,
     )
     from torch.distributed import DeviceMesh
     from torch.distributed.tensor.placement_types import Replicate, Shard
@@ -41,9 +45,32 @@ from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attr
 from megatron.training.global_vars import get_args
 
 
-def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
+def get_expert_index_from_key(key):
+    """Extract expert index from various expert key formats.
+
+    Supported formats:
+    - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
+    - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
+
+    Returns:
+        int: Expert index if found, None otherwise.
     """
-    Handle experts in model and optimizer state dicts.
+    # GroupedMLP: index is at the end after 'weight'
+    if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+        m = re.search(r'^.*\.mlp\.experts\.linear_fc\d\.weight(\d+)', key)
+        assert m, f"Failed to parse expert index from key: {key}"
+        return int(m.group(1))
+    # SequentialMLP: index is between 'local_experts.' and next '.'
+    elif 'mlp.experts.local_experts' in key:
+        m = re.search(r'^.*\.mlp\.experts\.local_experts\.(\d+)', key)
+        assert m, f"Failed to parse expert index from key: {key}"
+        return int(m.group(1))
+    return None
+
+
+def handle_experts_in_state_dict(state_dict):
+    """
+    Rewrite expert keys in state dict.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
     args = get_args()
@@ -53,33 +80,6 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
     num_local_experts = args.num_experts // ep_size if args.num_experts else 0
     local_expert_start = ep_rank * num_local_experts
     local_expert_end = local_expert_start + num_local_experts
-
-    def get_expert_index_from_key(key):
-        """Extract expert index from various expert key formats.
-
-        Supported formats:
-        - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-        - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
-
-        Returns:
-            int: Expert index if found, None otherwise.
-        """
-        # GroupedMLP: index is at the end after 'weight'
-        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
-            # Handle SwiGLU weight{idx}_w and weight{idx}_v format
-            if key.endswith('_w') or key.endswith('_v'):
-                index_str = key.split('weight')[-1][:-2]
-            # Handle regular weight{idx} format
-            else:
-                index_str = key.split('weight')[-1]
-            if index_str.isdigit():
-                return int(index_str)
-        # SequentialMLP: index is between 'local_experts.' and next '.'
-        elif 'mlp.experts.local_experts' in key:
-            index_str = key.split('local_experts.')[-1].split('.', 1)[0]
-            if index_str.isdigit():
-                return int(index_str)
-        return None
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
@@ -114,10 +114,13 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
         del state_dict[key]
 
     # Process model state dict
-    for key in list(model_state_dict.keys()):
+    state_dict = state_dict.copy()
+    for key in list(state_dict.keys()):
         expert_index = get_expert_index_from_key(key)
         if not should_keep_expert_key(expert_index):
-            replace_expert_index_in_key(key, expert_index, model_state_dict)
+            replace_expert_index_in_key(key, expert_index, state_dict)
+
+    return state_dict
 
 
 def expert_param_local_key(key):
@@ -129,28 +132,6 @@ def expert_param_local_key(key):
     ep_rank = parallel_state.get_expert_model_parallel_rank()
     num_local_experts = args.num_experts // ep_size if args.num_experts else 0
     local_expert_start = ep_rank * num_local_experts
-
-    def get_expert_index_from_key(key):
-        """Extract expert index from various expert key formats.
-
-        Supported formats:
-        - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-        - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
-
-        Returns:
-            int: Expert index if found, None otherwise.
-        """
-        # GroupedMLP: index is at the end after 'weight'
-        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
-            index_str = key.split('weight')[-1]
-            if index_str.isdigit():
-                return int(index_str)
-        # SequentialMLP: index is between 'local_experts.' and next '.'
-        elif 'mlp.experts.local_experts' in key:
-            index_str = key.split('local_experts.')[-1].split('.', 1)[0]
-            if index_str.isdigit():
-                return int(index_str)
-        return None
 
     expert_index = get_expert_index_from_key(key)
     if expert_index is not None:
@@ -166,7 +147,11 @@ def expert_param_local_key(key):
     return key
 
 
-def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
+def handle_swiglu_in_state_dict(
+    model,
+    model_state_dict,
+    optimizer_state_dict,
+):
     """
     Handle SWiGLU in model and optimizer state dicts.
     """
@@ -233,15 +218,11 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         # Fake parameters w and v are used to provide the correct parameter
         # shape and Tensor-Parallelism information.
         per_tp_rank_shape = list(data.shape)
-        if getattr(dist_param, "tensor_model_parallel", False) or getattr(dist_param, "_mcore_tp", False):
-            if getattr(dist_param, "_tp_partition_dim", None) is not None:
-                tp_dim = dist_param._tp_partition_dim
-            elif getattr(dist_param, "partition_dim", None) is not None:
-                tp_dim = dist_param.partition_dim
-            else:
-                raise ValueError(
-                    "Tensor model parallel dimension not found"
-                )
+        if is_mcore_tensor_model_parallel(dist_param):
+            tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
+            assert tp_dim is not None, (
+                "Tensor model parallel dimension not found"
+            )
             per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
         linear_fc1_meta = torch.empty(*per_tp_rank_shape, device="meta")
         w_meta, v_meta = torch.chunk(linear_fc1_meta, 2, dim=swiglu_shard_axis)
@@ -266,6 +247,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         )
         return weight_w, weight_v
 
+    model_state_dict = model_state_dict.copy()
     for key in list(model_state_dict.keys()):
         if is_swiglu_key(key):
             dist_param = model.get_parameter(f"module.{key}")
@@ -281,28 +263,31 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             model_state_dict[f"{key}_v"] = weight_v
             del model_state_dict[key]
 
-    try:
-        optimizer_state_dict = optimizer_state_dict["state"]
-    except KeyError:
-        optimizer_state_dict = {}
-
-    if len(optimizer_state_dict) != 0:
-        for key in list(optimizer_state_dict.keys()):
+    optimizer_state_dict = optimizer_state_dict.copy()
+    if len(optimizer_state_dict["state"]) != 0:
+        opt_state_dict = optimizer_state_dict["state"]
+        new_opt_state_dict = {}
+        for key in list(opt_state_dict.keys()):
+            # Only process SWIGLU keys
             if not is_swiglu_key(key):
+                new_opt_state_dict[key] = opt_state_dict[key]
                 continue
-            optimizer_state_dict[f"{key}_w"] = optimizer_state_dict[key].copy()
-            optimizer_state_dict[f"{key}_v"] = optimizer_state_dict[key].copy()
+            new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
+            new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
             for subkey in ["exp_avg", "exp_avg_sq"]:
                 dist_param = model.get_parameter(
                     expert_param_local_key(key[len("module.") :])
                 )
                 weight_w, weight_v = split_swiglu_linear_fc1(
-                    optimizer_state_dict[key][subkey], dist_param, swiglu_shard_axis=0
+                    opt_state_dict[key][subkey], dist_param, swiglu_shard_axis=0,
+                    is_expert_param="mlp.experts" in key
                 )
                 # Update the optimizer state dict with the new keys
-                optimizer_state_dict[f"{key}_w"][subkey] = weight_w
-                optimizer_state_dict[f"{key}_v"][subkey] = weight_v
-            del optimizer_state_dict[key]
+                new_opt_state_dict[f"{key}_w"][subkey] = weight_w
+                new_opt_state_dict[f"{key}_v"][subkey] = weight_v
+        optimizer_state_dict["state"] = new_opt_state_dict
+
+    return model_state_dict, optimizer_state_dict
 
 
 def handle_fp8_extra_state_case(model_state_dict):
@@ -334,7 +319,7 @@ def flatten_state_dict(obj, parent_key="", sep="."):
     return items
 
 
-def print_diff_in_state_dicts(state_dict_metadata, load_state_dict):
+def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
     """
     Print the differences between two state dicts: metadata state dict and load state dict.
     This function compares the keys and shapes of the tensors in both dicts.
@@ -348,16 +333,16 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict):
     only_in_load = list(load_keys - meta_keys)
     in_both = list(meta_keys & load_keys)
 
-    print("Keys only in checkpoint metadata_state_dict(first 100):")
-    for k in sorted(only_in_meta[:100]):
+    print(f"Keys only in checkpoint metadata_state_dict(first {limit}):")
+    for k in sorted(only_in_meta[:limit]):
         print(f"  {k}")
 
-    print("\nKeys only in load_state_dict(first 100):")
-    for k in sorted(only_in_load[:100]):
+    print(f"\nKeys only in load_state_dict(first {limit}):")
+    for k in sorted(only_in_load[:limit]):
         print(f"  {k}")
 
-    print("\nKeys in both but with different shapes(first 100):")
-    for k in sorted(in_both[:100]):
+    print(f"\nKeys in both but with different shapes(first {limit}):")
+    for k in sorted(in_both[:limit]):
         v_meta = state_dict_metadata[k]
         v_load = load_state_dict[k]
         # If tensors, compare shape; else, compare type/values
@@ -406,7 +391,9 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
         )
         if isinstance(value, DTensor):
             full_value = gather_uneven_dtensor_to_full_tensor(value)
-            loaded_tensor = load_item_dict[key].redistribute(placements=[Replicate()])
+            loaded_tensor = load_item_dict[key].redistribute(
+                placements=[Replicate()] * len(value.placements),
+            )
             assert torch.allclose(
                 loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
             ), (

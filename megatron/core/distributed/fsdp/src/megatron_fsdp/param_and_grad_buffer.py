@@ -34,7 +34,13 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor.device_mesh import _mesh_resources
 
 from .uneven_dtensor import update_uneven_dtensor_chunk_metadata, validate_uneven_dtensor
-from .utils import _MODEL_PARALLEL_RNG_TRACKER_NAME, FSDPDistributedIndex, get_global_memory_buffer
+from .utils import (
+    _MODEL_PARALLEL_RNG_TRACKER_NAME,
+    FSDPDistributedIndex,
+    get_global_memory_buffer,
+    is_mcore_tensor_model_parallel,
+    get_mcore_tensor_parallel_partition_dim,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3619,18 +3625,14 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if getattr(param, "tensor_model_parallel", False) and not getattr(param, "_tp_duplicated", False):
+    if is_mcore_tensor_model_parallel(param):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
             "is True. Check usage."
         )
 
-        if hasattr(param, "_tp_partition_dim"):
-            tp_dim = param._tp_partition_dim
-        else:
-            tp_dim = param.partition_dim
-
+        tp_dim = get_mcore_tensor_parallel_partition_dim(param)
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
 
         # Adjust shape for global dimension
