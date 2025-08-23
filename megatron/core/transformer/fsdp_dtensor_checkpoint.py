@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import torch
 
 try:
@@ -53,7 +54,12 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         # GroupedMLP: index is at the end after 'weight'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
-            index_str = key.split('weight')[-1]
+            # Handle SwiGLU weight{idx}_w and weight{idx}_v format
+            if key.endswith('_w') or key.endswith('_v'):
+                index_str = key.split('weight')[-1][:-2]
+            # Handle regular weight{idx} format
+            else:
+                index_str = key.split('weight')[-1]
             if index_str.isdigit():
                 return int(index_str)
         # SequentialMLP: index is between 'local_experts.' and next '.'
@@ -77,14 +83,24 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
         new_expert_index = expert_index + local_expert_start
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
-            new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
+            # Handle SwiGLU weight{idx}_w and weight{idx}_v format
+            if key.endswith('_w') or key.endswith('_v'):
+                suffix = key[-2:]  # '_w' or '_v'
+                new_key = key.replace(
+                    f'weight{expert_index}{suffix}', f'weight{new_expert_index}{suffix}'
+                )
+            # Handle regular weight{idx} format
+            else:
+                new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
         # SequentialMLP: index is between 'local_experts.' and next '.'
         elif 'mlp.experts.local_experts' in key:
-            new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.')
+            new_key = key.replace(
+                f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.'
+            )
 
         state_dict[new_key] = state_dict[key]
         del state_dict[key]
-    
+
     # Process model state dict
     for key in list(model_state_dict.keys()):
         expert_index = get_expert_index_from_key(key)
@@ -95,7 +111,9 @@ def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
     for key in list(optimizer_state_dict["param_to_group_meta"].keys()):
         expert_index = get_expert_index_from_key(key)
         if not should_keep_expert_key(expert_index):
-            replace_expert_index_in_key(key, expert_index, optimizer_state_dict["param_to_group_meta"])
+            replace_expert_index_in_key(
+                key, expert_index, optimizer_state_dict["param_to_group_meta"]
+            )
 
     try:
         optimizer_state_dict = optimizer_state_dict["state"]
@@ -127,7 +145,23 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def offset_slice(s, offset):
         return slice(s.start + offset, s.stop + offset)
 
-    def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis):
+    def is_swiglu_key(key):
+        """
+        Check if this key should be handled as SwiGLU linear_fc1 weight or bias.
+        """
+        # Non-expert MLP: 'mlp.linear_fc1.weight', 'mlp.linear_fc1.bias'
+        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc1.bias0'
+        # SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc1.bias'
+        return any(re.search(pat, key) for pat in [
+            r"(.*)\.mlp\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.linear_fc1\.bias$",
+            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
+            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+        ])
+
+    def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
         """
@@ -139,7 +173,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
-        tp_mesh = megatron_fsdp_dist_index.get_submesh([megatron_fsdp_dist_index.tp_dim])
+        tp_mesh = megatron_fsdp_dist_index.get_submesh(
+            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
+        )
         data_size = data.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
@@ -171,6 +207,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             weight_w.data,
             w_meta,
             dist_index=megatron_fsdp_dist_index,
+            is_expert_param=is_expert_param,
             run_check=True,
             update_uneven_dtensor_chunk_meta=True,
         )
@@ -178,16 +215,20 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             weight_v.data,
             v_meta,
             dist_index=megatron_fsdp_dist_index,
+            is_expert_param=is_expert_param,
             run_check=True,
             update_uneven_dtensor_chunk_meta=True,
         )
         return weight_w, weight_v
 
     for key in list(model_state_dict.keys()):
-        if key.endswith('mlp.linear_fc1.weight') or key.endswith('mlp.linear_fc1.bias'):
+        if is_swiglu_key(key):
             dist_param = model.get_parameter(f"module.{key}")
             weight_w, weight_v = split_swiglu_linear_fc1(
-                model_state_dict[key], dist_param, swiglu_shard_axis=0
+                model_state_dict[key],
+                dist_param,
+                swiglu_shard_axis=0,
+                is_expert_param='mlp.experts' in key,
             )
 
             # Update the model state dict with the new keys
@@ -202,7 +243,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     if len(optimizer_state_dict) != 0:
         for key in list(optimizer_state_dict.keys()):
-            if not (key.endswith('mlp.linear_fc1.weight') or key.endswith('mlp.linear_fc1.bias')):
+            if not is_swiglu_key(key):
                 continue
             optimizer_state_dict[f"{key}_w"] = optimizer_state_dict[key].copy()
             optimizer_state_dict[f"{key}_v"] = optimizer_state_dict[key].copy()
