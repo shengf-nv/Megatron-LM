@@ -322,9 +322,7 @@ class MegatronFSDP(torch.nn.Module):
         )
 
         # Set the suggested communication unit size for reduce-scatter and all-gather pipelines.
-        suggested_communication_unit_size = (
-            self.ddp_config.suggested_communication_unit_size or 1_000_000_000
-        )
+        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
         if suggested_communication_unit_size is None:
             if self.data_parallel_sharding_strategy == "optim_grads_params":
                 total_param_elements = 0
