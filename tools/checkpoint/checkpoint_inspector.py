@@ -271,6 +271,68 @@ def flatten(obj, parent_key="", sep="."):
     return items
 
 
+def handle_swiglu_weights(key: str, value: torch.Tensor, state_dict: dict) -> None:
+    """
+    Handle SwiGLU weights by splitting them into weight_w and weight_v.
+
+    Args:
+        key (str): The original key that contains "mlp.linear_fc1.weight"
+        value (torch.Tensor): The original weight tensor to split
+        state_dict (dict): The state dict to store the split weights
+    """
+    w, v = torch.chunk(value, 2, dim=0)
+    w = w.redistribute(placements=[Shard(0)])
+    v = v.redistribute(placements=[Shard(0)])
+    w_key = key.replace("mlp.linear_fc1.weight", "mlp.linear_fc1.weight_w")
+    v_key = key.replace("mlp.linear_fc1.weight", "mlp.linear_fc1.weight_v")
+    # Store both w and v in the state_dict
+    state_dict[w_key] = w
+    state_dict[v_key] = v
+
+
+def handle_expert_weights(key: str, value: torch.Tensor, state_dict: dict) -> None:
+    """
+    Handle MoE expert weights by splitting them into individual expert weights.
+
+    Args:
+        key (str): The original key that contains "experts.experts.linear_fc1.weight"
+            or "experts.experts.linear_fc2.weight"
+        value (torch.Tensor): The original weight tensor to split
+        state_dict (dict): The state dict to store the split weights
+    """
+    layer_key = key.replace(".experts.experts.", ".experts.")
+    expert_weights = torch.split(value, 1, dim=0)
+    for expert_idx, expert_weight in enumerate(expert_weights):
+        layer_key_parts = layer_key.split(".weight", 1)
+        if len(layer_key_parts) == 1:
+            expert_key = f"{layer_key}{expert_idx}"
+        elif len(layer_key_parts) == 2:
+            expert_key = f"{layer_key_parts[0]}.weight{expert_idx}{layer_key_parts[1]}"
+        else:
+            raise ValueError(f"Unexpected expert layer key: {layer_key}")
+        state_dict[expert_key] = expert_weight
+
+
+def store_layer_value(
+    layer_key: str, layer_value: torch.Tensor, state_dict: dict, swiglu: bool
+) -> None:
+    """
+    Store the layer value with appropriate handling for SwiGLU and MoE.
+    """
+    if swiglu and "mlp.linear_fc1.weight" in layer_key:
+        # Special case for SwiGLU
+        handle_swiglu_weights(layer_key, layer_value, state_dict)
+    elif (
+        "experts.experts.linear_fc1.weight" in layer_key
+        or "experts.experts.linear_fc2.weight" in layer_key
+    ):
+        # Special case for MoE experts
+        handle_expert_weights(layer_key, layer_value, state_dict)
+    else:
+        # General case
+        state_dict[layer_key] = layer_value
+
+
 def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol=4):
     writer = FileSystemWriter(output_dir)
     planner = DefaultSavePlanner()
@@ -382,11 +444,19 @@ def convert_checkpoint(
             # Skip extra states
             continue
 
+        if "optimizer.state.fp32_param" in key:
+            # Skip torch.float32 optimizer states parameters in MoE model
+            continue
+
         if isinstance(value, torch.Tensor):
             if key.startswith("optimizer.state."):
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
+            elif key.startswith("chained_"):
+                # Special handling for chained optimizer state
+                key_list = key.split(".")
+                new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[4:])}.{key_list[3]}"
             else:
                 # Special handling for module parameters
                 new_key = f"{model_weight_prefix}.{key}"
@@ -408,57 +478,34 @@ def convert_checkpoint(
 
             # Handle multi-layer tensors
             if ".layers." in new_key:
-                n_layer = value.shape[0]
-
                 _free_up_some_gpu_memory()
-                per_layer_values = [
-                    gather_uneven_dtensor_to_full_tensor(v).redistribute(
-                        placements=[Shard(len(v.shape) - 1)]
-                    )
-                    for v in split_dtensor(value, 1, dim=0)
-                ]
-                for i in range(n_layer):
-                    if orig_shape is not None:
-                        layer_shape = orig_shape[1:]
-                    else:
-                        layer_shape = value.shape[1:]
 
-                    per_layer_values[i] = (
-                        per_layer_values[i]
-                        .reshape(layer_shape)
-                        .redistribute(placements=[Shard(0)])
-                    )
-                for i in range(0, n_layer):
-                    layer_key = new_key.replace(".layers.", f".layers.{i}.")
-                    if swiglu and "mlp.linear_fc1.weight" in layer_key:
-                        # Special case for SwiGLU
-                        w, v = torch.chunk(per_layer_values[i], 2, dim=0)
-                        w = w.redistribute(placements=[Shard(0)])
-                        v = v.redistribute(placements=[Shard(0)])
-                        w_key = layer_key.replace(
-                            "mlp.linear_fc1.weight", "mlp.linear_fc1.weight_w"
+                contain_layer_index = re.search(r"layers\.(\d+)\.", new_key)
+                if contain_layer_index:
+                    layer_shape = orig_shape if orig_shape is not None else value.shape
+                    value = value.reshape(layer_shape)
+                    store_layer_value(new_key, value, fsdp_dtensor_state_dict, swiglu)
+
+                else:
+                    n_layer = value.shape[0]
+                    per_layer_values = [
+                        gather_uneven_dtensor_to_full_tensor(v).redistribute(
+                            placements=[Shard(len(v.shape) - 1)]
                         )
-                        v_key = layer_key.replace(
-                            "mlp.linear_fc1.weight", "mlp.linear_fc1.weight_v"
+                        for v in split_dtensor(value, 1, dim=0)
+                    ]
+                    for i in range(n_layer):
+                        layer_shape = orig_shape[1:] if orig_shape is not None else value.shape[1:]
+                        per_layer_values[i] = (
+                            per_layer_values[i]
+                            .reshape(layer_shape)
+                            .redistribute(placements=[Shard(0)])
                         )
-                        # Store both w and v in the state_dict
-                        fsdp_dtensor_state_dict[w_key] = w
-                        fsdp_dtensor_state_dict[v_key] = v
-                    elif (
-                        "experts.experts.linear_fc1.weight" in layer_key
-                        or "experts.experts.linear_fc2.weight" in layer_key
-                    ):
-                        # Special case for MoE
-                        layer_key = layer_key.replace(".experts.experts.", ".experts.")
-                        expert_weights = torch.split(per_layer_values[i], 1, dim=0)
-                        for expert_idx, expert_weight in enumerate(expert_weights):
-                            expert_key = f"{layer_key}{expert_idx}"
-                            fsdp_dtensor_state_dict[expert_key] = expert_weight.squeeze(
-                                0
-                            )
-                    else:
-                        # General case
-                        fsdp_dtensor_state_dict[layer_key] = per_layer_values[i]
+                        layer_key = new_key.replace(".layers.", f".layers.{i}.")
+                        store_layer_value(
+                            layer_key, per_layer_values[i], fsdp_dtensor_state_dict, swiglu
+                        )
+
             else:
                 if orig_shape is not None:
                     _free_up_some_gpu_memory()
@@ -467,7 +514,7 @@ def convert_checkpoint(
                         .reshape(orig_shape)
                         .redistribute(placements=[Shard(0)])
                     )
-                fsdp_dtensor_state_dict[new_key] = value
+                    store_layer_value(new_key, value, fsdp_dtensor_state_dict, swiglu)
         elif key.startswith("rng_state"):
             # Skip RNG states
             continue
