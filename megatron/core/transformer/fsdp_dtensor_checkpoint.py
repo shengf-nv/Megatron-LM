@@ -23,7 +23,91 @@ try:
 except ImportError:
     HAVE_MEGATRON_FSDP = False
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
+from megatron.training.global_vars import get_args
+
+
+def handle_experts_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """
+    Handle experts in model and optimizer state dicts.
+    """
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    args = get_args()
+
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    num_local_experts = args.num_experts // ep_size
+    local_expert_start = ep_rank * num_local_experts
+    local_expert_end = local_expert_start + num_local_experts
+
+    def get_expert_index_from_key(key):
+        """Extract expert index from various expert key formats.
+
+        Supported formats:
+        - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
+        - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
+
+        Returns:
+            int: Expert index if found, None otherwise.
+        """
+        # GroupedMLP: index is at the end after 'weight'
+        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+            index_str = key.split('weight')[-1]
+            if index_str.isdigit():
+                return int(index_str)
+        # SequentialMLP: index is between 'local_experts.' and next '.'
+        elif 'mlp.experts.local_experts' in key:
+            index_str = key.split('local_experts.')[-1].split('.', 1)[0]
+            if index_str.isdigit():
+                return int(index_str)
+        return None
+
+    def should_keep_expert_key(expert_index):
+        """Determine if this rank should keep this expert key based on expert index"""
+        if expert_index is None:
+            # If we can't determine expert index, keep the key (non-expert weights)
+            return True
+
+        # Check if this expert belongs to this rank
+        return local_expert_start <= expert_index < local_expert_end
+
+    def replace_expert_index_in_key(key, expert_index, state_dict):
+        """Replace expert index in key with new index corresponding to the current rank"""
+        new_expert_index = expert_index + local_expert_start
+        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
+        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+            new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
+        # SequentialMLP: index is between 'local_experts.' and next '.'
+        elif 'mlp.experts.local_experts' in key:
+            new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.')
+
+        state_dict[new_key] = state_dict[key]
+        del state_dict[key]
+    
+    # Process model state dict
+    for key in list(model_state_dict.keys()):
+        expert_index = get_expert_index_from_key(key)
+        if not should_keep_expert_key(expert_index):
+            replace_expert_index_in_key(key, expert_index, model_state_dict)
+
+    # Process optimizer state param_group dict
+    for key in list(optimizer_state_dict["param_to_group_meta"].keys()):
+        expert_index = get_expert_index_from_key(key)
+        if not should_keep_expert_key(expert_index):
+            replace_expert_index_in_key(key, expert_index, optimizer_state_dict["param_to_group_meta"])
+
+    try:
+        optimizer_state_dict = optimizer_state_dict["state"]
+    except KeyError:
+        optimizer_state_dict = {}
+
+    # Process optimizer state dict
+    if len(optimizer_state_dict) != 0:
+        for key in list(optimizer_state_dict.keys()):
+            expert_index = get_expert_index_from_key(key)
+            if not should_keep_expert_key(expert_index):
+                replace_expert_index_in_key(key, expert_index, optimizer_state_dict)
 
 
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):

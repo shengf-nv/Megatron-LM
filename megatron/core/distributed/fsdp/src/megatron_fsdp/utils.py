@@ -668,6 +668,7 @@ class FSDPDistributedIndex:
     def __init__(
         self,
         device_mesh: DeviceMesh,
+        expt_device_mesh: Optional[DeviceMesh] = None,
         use_hybrid_fsdp: bool = False,
         hsdp_outer_dp_shard: bool = False,
         dp_shard_dim: Optional[str] = None,
@@ -678,6 +679,8 @@ class FSDPDistributedIndex:
         """
         Args:
             device_mesh (DeviceMesh): The DeviceMesh to use for the DistributedIndex.
+            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
+                to use for the DistributedIndex.
             use_hybrid_fsdp (bool): Whether to use hybrid FSDP, i.e. a combination
                 of replicate and sharded data parallel groups.
             hsdp_outer_dp_shard (bool): Whether to have dp inter group sharding
@@ -694,6 +697,7 @@ class FSDPDistributedIndex:
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
+        self.expt_device_mesh = expt_device_mesh
         self.dp_shard_dim = dp_shard_dim
         self.dp_inter_dim = dp_inter_dim
         self.tp_dim = tp_dim
@@ -716,6 +720,13 @@ class FSDPDistributedIndex:
         # Save a reference to the overall HSDP process group, which is the flattened
         # combination of the inter-FSDP and FSDP process groups.
         self.hybrid_fsdp_group = hybrid_fsdp_group
+
+        # Retrieve the expert parallel process groups from the DeviceMesh.
+        self.expt_fsdp_group = (
+            self.expt_device_mesh[self.dp_shard_dim].get_group()
+            if self.expt_device_mesh is not None and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
+            else None
+        )
 
         """
         Store a persistent reference to the core device meshes that back Megatron-FSDP.
@@ -774,26 +785,30 @@ class FSDPDistributedIndex:
                     "process groups or sub-meshes."
                 )
 
-    def get_submesh(self, mesh_dim_names: str | Sequence[str]) -> DeviceMesh:
+    def get_submesh(
+        self,
+        mesh_dim_names: str | Sequence[str],
+        is_expert_parallel: bool = False,
+    ) -> DeviceMesh:
         """
         Retrieve an Megatron-FSDP-registered sub-mesh by name(s).
         """
         if isinstance(mesh_dim_names, str):
             mesh_dim_names = (mesh_dim_names,)
         # Search for the sub-mesh in the mesh library.
-        device_submesh = self.mesh_library.get(tuple(mesh_dim_names), None)
-        if device_submesh is None:
-            raise ValueError(
-                f"[FSDPDistributedIndex][get_submesh] No sub-mesh with "
-                f"mesh_dim_names={mesh_dim_names} has been registered with Megatron-FSDP."
-            )
-        return device_submesh
+        submesh_identifier = tuple([is_expert_parallel, ] + list(mesh_dim_names))
+        if is_expert_parallel:
+            if submesh_identifier not in self.mesh_library:
+                self.mesh_library[submesh_identifier] = self.expt_device_mesh[tuple(mesh_dim_names)]
+        else:
+            if submesh_identifier not in self.mesh_library:
+                self.mesh_library[submesh_identifier] = self.device_mesh[tuple(mesh_dim_names)]
+        return self.mesh_library[submesh_identifier]
 
     def get_dp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the data parallel process group."""
         if is_expert_parallel:
-            # Expert parallel is not supported
-            return None
+            return self.expt_fsdp_group
         if self.use_hybrid_fsdp:
             return self.hybrid_fsdp_group
         return self.fsdp_group
@@ -801,14 +816,13 @@ class FSDPDistributedIndex:
     def get_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the FSDP process group."""
         if is_expert_parallel:
-            # Expert parallel is not supported
-            return None
+            return self.expt_fsdp_group
         return self.fsdp_group
 
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
         """Get the device mesh."""
         if is_expert_parallel:
-            raise NotImplementedError("Expert parallel is not supported in Megatron-FSDP.")
+            return self.expt_device_mesh
         return self.device_mesh
 
     def get_logical_hybrid_fsdp_rank(self):

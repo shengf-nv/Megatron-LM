@@ -70,6 +70,7 @@ def fully_shard(
     use_hybrid_fsdp: bool = False,
     outer_dp_sharding_strategy: str = "no_shard",
     device_mesh: Optional[DeviceMesh] = None,
+    expt_device_mesh: Optional[DeviceMesh] = None,
     dp_shard_dim: Optional[str] = None,
     dp_inter_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
@@ -139,6 +140,11 @@ def fully_shard(
             in which case the {dp_shard,dp_replicate,tp}_group(s) are required to
             use Megatron-FSDP. If device_mesh is None, Megatron-FSDP will automatically use
             torch.distributed.group.WORLD for sharded data parallelism.
+
+        expt_device_mesh (Optional[DeviceMesh]):
+            Expert parallel device mesh object defining the topology for MoE distributed training.
+            Defaults to None, in which case the {expt_dp_shard,ep,expt_tp}_group(s) are required to
+            use Megatron-FSDP.
 
         dp_shard_dim (Optional[str]):
             Name of the data parallel sharding sub-mesh in the device_mesh. Supports
@@ -274,6 +280,7 @@ def fully_shard(
     # Create FSDPDistributedIndex.
     dist_index = FSDPDistributedIndex(
         device_mesh=device_mesh,
+        expt_device_mesh=expt_device_mesh,
         use_hybrid_fsdp=use_hybrid_fsdp,
         hsdp_outer_dp_shard=outer_dp_sharding_strategy != "no_shard",
         dp_shard_dim=dp_shard_dim,

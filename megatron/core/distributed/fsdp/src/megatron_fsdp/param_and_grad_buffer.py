@@ -3436,7 +3436,9 @@ def to_local_if_dtensor(tensor):
     return tensor
 
 
-def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_param):
+def _get_fsdp_tensor_spec(
+    param, dist_index: FSDPDistributedIndex, is_sharded_param, is_expert_param
+):
     """
     Get the DeviceMesh for the parameter and modify the placement for Megatron-FSDP.
     """
@@ -3447,7 +3449,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
         dtensor_mesh = getattr(dtensor_spec, "mesh", None)
 
         # Validate that the DTensor root mesh is identical to the Megatron-FSDP device mesh.
-        megatron_fsdp_global_mesh = dist_index.get_root_mesh()
+        megatron_fsdp_global_mesh = dist_index.get_root_mesh(is_expert_parallel=is_expert_param)
         dtensor_global_mesh = _mesh_resources.get_root_mesh(dtensor_mesh)
         # FIXME(boxiangw): add or megatron_fsdp_global_mesh != dtensor_global_mesh:
         # _mesh_resources.get_root_mesh(dtensor_mesh) is not getting the correct root mesh
@@ -3492,7 +3494,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
             placements = [Shard(0), dtensor_placement]
             shard_order = [1, 0]
 
-        device_mesh = dist_index.get_submesh(mesh_dim_names)
+        device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
         if shard_order is not None:
             setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3517,7 +3519,7 @@ def _get_fsdp_tensor_spec(param, dist_index: FSDPDistributedIndex, is_sharded_pa
     else:
         placements = [Shard(0)]
 
-    device_mesh = dist_index.get_submesh(mesh_dim_names)
+    device_mesh = dist_index.get_submesh(mesh_dim_names, is_expert_parallel=is_expert_param)
     if shard_order is not None:
         setattr(device_mesh, "_shard_order", shard_order)
 
@@ -3630,7 +3632,7 @@ def make_fsdp_dtensor(
         "tensor_model_parallel."
 
         tp_dim = param.partition_dim
-        tp_mesh = dist_index.get_submesh(dist_index.tp_dim)
+        tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
 
         # Adjust shape for global dimension
         if tp_mesh.mesh.numel() > 1:
@@ -3649,7 +3651,7 @@ def make_fsdp_dtensor(
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
-        param, dist_index, is_sharded_param=is_sharded_param
+        param, dist_index, is_sharded_param=is_sharded_param, is_expert_param=is_expert_param
     )
 
     # Reshape local tensor for sharded layouts beyond 1D

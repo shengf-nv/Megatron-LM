@@ -42,6 +42,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        handle_experts_in_state_dict,
         handle_swiglu_in_state_dict,
         handle_fp8_extra_state_case,
         print_diff_in_state_dicts,
@@ -821,6 +822,9 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
         if args.swiglu:
             state_dict = state_dict.copy()
             handle_swiglu_in_state_dict(
+                model[0], state_dict["model"], state_dict["optimizer"])
+        if args.num_experts > 0:
+            handle_experts_in_state_dict(
                 model[0], state_dict["model"], state_dict["optimizer"])
         handle_fp8_extra_state_case(state_dict["model"])
         preprocess_state_dict_for_uneven_dtensor(state_dict)

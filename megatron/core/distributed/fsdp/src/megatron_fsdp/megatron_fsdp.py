@@ -201,7 +201,7 @@ class MegatronFSDP(torch.nn.Module):
         self.dist_index = dist_index
 
         # If Megatron Expert Parallelism is enabled, you need to provide an expt_dp_group.
-        if has_expert_parameters and self.dist_index.get_expert_dp_group() is None:
+        if has_expert_parameters and self.dist_index.get_fsdp_group(is_expert_parallel=True) is None:
             raise ValueError(
                 "[Megatron-FSDP] Megatron Expert Parallelism is enabled, but no expt_dp_group is"
                 "provided."
