@@ -435,6 +435,8 @@ def convert_checkpoint(
             r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
             r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
             r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
         ])
 
     def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:

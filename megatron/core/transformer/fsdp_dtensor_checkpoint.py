@@ -182,6 +182,8 @@ def handle_swiglu_in_state_dict(
             r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
             r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
             r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
         ])
 
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
