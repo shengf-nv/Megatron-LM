@@ -27,6 +27,7 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -467,6 +468,7 @@ def get_megatron_optimizer(
     default_skip_embedding_weight_decay: bool = False,
     grad_comm_pgs: Optional[GradCommProcessGroups] = None,
     model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+    dump_param_to_param_group_map: Optional[str] = None,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -491,6 +493,7 @@ def get_megatron_optimizer(
             If None, uses default parallel_state groups.
         model_comm_pgs (Optional[ModelCommProcessGroups]): model communication process groups.
             If None, uses default parallel_state groups.
+        dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -668,6 +671,9 @@ def get_megatron_optimizer(
 
         return ChainedOptimizer(optimizers)
 
+    if dump_param_to_param_group_map is not None:
+        param_to_param_group = {}
+        param_group_id = 0
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
@@ -686,6 +692,12 @@ def get_megatron_optimizer(
             model_chunk.overlap_param_gather_with_optimizer_step = (
                 overlap_param_gather_with_optimizer_step
             )
+        if dump_param_to_param_group_map is not None:
+            for param_group in param_groups:
+                for param in param_group["params"]:
+                    param_name = get_global_unique_param_name(model_chunks, param)
+                    param_to_param_group[param_name] = param_group_id
+                param_group_id += 1
 
         # Pass Gloo process groups into optimizer only if needed.
         optimizers.append(
@@ -714,6 +726,12 @@ def get_megatron_optimizer(
         buffer_name='expert_parallel_buffers',
         default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
+    if dump_param_to_param_group_map is not None:
+        for param_group in moe_param_groups:
+            for param in param_group["params"]:
+                param_name = get_global_unique_param_name(model_chunks, param)
+                param_to_param_group[param_name] = param_group_id
+            param_group_id += 1
     if len(moe_param_groups) > 0:
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed.
@@ -733,6 +751,12 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=expt_model_parallel_rank,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
+        )
+
+    if dump_param_to_param_group_map is not None:
+        torch.distributed.checkpoint.save(
+            state_dict=param_to_param_group,
+            checkpoint_id=dump_param_to_param_group_map,
         )
 
     return ChainedOptimizer(optimizers)

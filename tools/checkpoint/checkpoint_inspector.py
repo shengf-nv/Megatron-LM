@@ -9,6 +9,7 @@ import time
 import re
 import shutil
 from typing import Optional
+import tempfile
 
 import click
 import torch
@@ -20,6 +21,7 @@ from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
 )
+from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.metadata import (
     BytesStorageMetadata,
     TensorStorageMetadata,
@@ -334,8 +336,10 @@ def convert_checkpoint(
     output_dir,
     swiglu,
     process_group,
+    optimizer_param_to_group_prefix="optimizer.param_to_group_meta.module.module.module",
     optimizer_state_prefix="optimizer.state.module.module.module",
     model_weight_prefix="model.module",
+    param_to_param_group_map={},
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to standard fsdp_dtensor format."""
     device_mesh = DeviceMesh.from_group(process_group, device_type="cuda")
@@ -429,14 +433,14 @@ def convert_checkpoint(
 
     def is_swiglu_key(key):
         return any(re.search(pat, key) for pat in [
-            r"(.*)\.mlp\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.linear_fc1\.bias$",
-            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
-            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
+            r"(.*)\.mlp\.linear_fc1\.weight",
+            r"(.*)\.mlp\.linear_fc1\.bias",
+            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
+            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
+            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
+            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
         ])
 
     def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -473,9 +477,11 @@ def convert_checkpoint(
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
+                is_param = False
             else:
                 # Special handling for module parameters
                 new_key = f"{model_weight_prefix}.{key}"
+                is_param = True
 
             # Handle dist-opt flatten tensors
             if (
@@ -505,13 +511,17 @@ def convert_checkpoint(
                     ).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            for key, value in split_tensors.items():
+            # Handle SWiGLU weights
+            for key, value in list(split_tensors.items()):
                 if swiglu and is_swiglu_key(key):
                     swiglu_w_and_v = split_swiglu_weight(key, value)
-                    fsdp_dtensor_state_dict.update(swiglu_w_and_v)
-                else:
-                    # General case
-                    fsdp_dtensor_state_dict[key] = value
+                    split_tensors.update(swiglu_w_and_v)
+                    del split_tensors[key]
+
+            fsdp_dtensor_state_dict.update(split_tensors)
+            if is_param and key in param_to_param_group_map:
+                for new_key in split_tensors.keys():
+                    param_to_param_group_map[new_key] = param_to_param_group_map[key]
         elif key.startswith("rng_state"):
             # Skip RNG states
             continue
@@ -574,6 +584,15 @@ def convert_checkpoint(
         )
     )
     common_state = common_strategy.load_common(input_dir)
+    try:
+        if "param_groups" in common_state["optimizer"]:
+            ckpt_param_groups = common_state["optimizer"]["param_groups"]
+        else:
+            ckpt_param_groups = []
+            for opt_state_dict in common_state["optimizer"].values():
+                ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
+    except:
+        ckpt_param_groups = None
     common_state = flatten(common_state)
     for key, value in common_state.items():
         if key.startswith("optimizer.optimizer.param_groups."):
@@ -584,6 +603,20 @@ def convert_checkpoint(
             f"Key '{key}' already exists in fsdp_dtensor_state_dict."
         )
         fsdp_dtensor_state_dict[key] = value
+
+    # set up per-parameter param_groups
+    if param_to_param_group_map and ckpt_param_groups is not None:
+        for name in list(fsdp_dtensor_state_dict.keys()):
+            if not name.startswith(model_weight_prefix) or name.endswith(".expert_bias"):
+                continue
+
+            assert name in param_to_param_group_map, f"Missing param group for {name}"
+            param_group_id = param_to_param_group_map[name]
+            assert param_group_id < len(ckpt_param_groups), f"Invalid param group id {param_group_id} for {name}"
+            name_without_prefix = name[len(model_weight_prefix):]
+            fsdp_dtensor_state_dict[
+                f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
+            ] = ckpt_param_groups[param_group_id]
 
     # # Move fp32_param to model weights
     # for key in list(fsdp_dtensor_state_dict.keys()):
@@ -621,12 +654,6 @@ def convert_checkpoint(
 )
 @click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
 @click.option(
-    "--distributed-timeout-minutes",
-    default=10,
-    type=int,
-    help="Timeout for distributed operations in minutes.",
-)
-@click.option(
     "--output-optimizer-state-prefix",
     default="optimizer.state.module.module.module",
     help="Prefix for optimizer state keys in the checkpoint.",
@@ -636,15 +663,21 @@ def convert_checkpoint(
     default="model.module",
     help="Prefix for model weight keys in the checkpoint.",
 )
+@click.option(
+    "--param-to-param-group-map-json",
+    type=str,
+    default="{}",
+    help="JSON string representing the param to parameter group map."
+)
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
     swiglu,
     oom_traceback,
     enable_msc,
-    distributed_timeout_minutes,
     output_optimizer_state_prefix,
     output_model_weight_prefix,
+    param_to_param_group_map_json,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format."""
     if not enable_msc:
@@ -688,6 +721,7 @@ def convert_torch_dist_to_fsdp_dtensor(
         ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
+        param_to_param_group_map=json.loads(param_to_param_group_map_json),
     )
 
     click.echo(
@@ -874,6 +908,20 @@ def compare_two_checkpoint(checkpoint_1, checkpoint_2, enable_msc):
             f"Comparison between {checkpoint_1} and {checkpoint_2} completed.", fg="green", bold=True
         )
     )
+
+
+@cli.command()
+@click.argument("torch_dcp_dir", type=click.Path(exists=True))
+def print_torch_dcp_in_json(torch_dcp_dir):
+    # Use a temporary file context
+    with tempfile.NamedTemporaryFile(suffix=".pth") as tmp_file:
+        # Convert distributed checkpoint directory to a single-file checkpoint
+        dcp_to_torch_save(torch_dcp_dir, tmp_file.name)
+
+        # Load the state dict from the temporary file
+        state_dict = torch.load(tmp_file.name, map_location="cpu")
+
+        click.echo(f"torch dcp content: {json.dumps(state_dict)}")
 
 
 def init_process_group(message):

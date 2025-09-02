@@ -43,6 +43,29 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.training.global_vars import get_args
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+
+def get_ep_layer_offset():
+    """
+    Get the expert layer offset for the current model.
+    """
+    args = get_args()
+    ep_size = parallel_state.get_expert_model_parallel_world_size()
+    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
+    local_expert_offset = ep_rank * num_local_experts
+
+    return local_expert_offset
+
+
+def get_total_num_experts():
+    """
+    Get the total number of experts for the current model.
+    """
+    args = get_args()
+    return args.num_experts if args.num_experts else 0
 
 
 def get_expert_index_from_key(key):
@@ -72,14 +95,8 @@ def handle_experts_in_state_dict(state_dict):
     """
     Rewrite expert keys in state dict.
     """
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
-    args = get_args()
-
-    ep_size = parallel_state.get_expert_model_parallel_world_size()
-    ep_rank = parallel_state.get_expert_model_parallel_rank()
-    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
-    local_expert_start = ep_rank * num_local_experts
-    local_expert_end = local_expert_start + num_local_experts
+    local_expert_start = get_ep_layer_offset()
+    local_expert_end = get_total_num_experts()
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
@@ -125,17 +142,10 @@ def handle_experts_in_state_dict(state_dict):
 
 def expert_param_local_key(key):
     """Get the module parameter corresponding to the key."""
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
-    args = get_args()
-
-    ep_size = parallel_state.get_expert_model_parallel_world_size()
-    ep_rank = parallel_state.get_expert_model_parallel_rank()
-    num_local_experts = args.num_experts // ep_size if args.num_experts else 0
-    local_expert_start = ep_rank * num_local_experts
-
+    local_expert_offset = get_ep_layer_offset()
     expert_index = get_expert_index_from_key(key)
     if expert_index is not None:
-        new_expert_index = expert_index - local_expert_start
+        new_expert_index = expert_index - local_expert_offset
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
             new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
@@ -405,3 +415,35 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             assert torch.allclose(value, load_item_dict[key]), (
                 f"key: {key}; {value} {load_item_dict[key]}"
             )
+
+
+def get_global_unique_param_name(model_chunks, param):
+    """
+    Get the global unique parameter name for a given model and parameter.
+    """
+    param_name = None
+    for model in model_chunks:
+        for name, p in model.named_parameters():
+            if p is param:
+                param_name = name
+                break
+    if param_name is None:
+        raise ValueError("Parameter not found in model chunks")
+
+    # Get PP unique parameter name
+    if re.search(r"layers\.(\d+)", param_name) and "mtp" not in param_name:
+        tf_layer_number = -1
+        for module in model.modules():
+            if not isinstance(module, TransformerLayer):
+                continue
+            for p in module.parameters():
+                if p is param:
+                    tf_layer_number = module.layer_number
+                    break
+        if tf_layer_number != -1:
+            param_name = re.sub(r"layers\.(\d+)", f"layers.{tf_layer_number - 1}", param_name)
+
+    # Get EP unique parameter name
+    param_name = list(handle_experts_in_state_dict({param_name: None}).keys())[0]
+
+    return param_name
