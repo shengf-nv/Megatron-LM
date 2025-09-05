@@ -54,6 +54,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_network_size_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
+    parser = _add_rl_args(parser)
     parser = _add_initialization_args(parser)
     parser = _add_learning_rate_args(parser)
     parser = _add_checkpointing_args(parser)
@@ -370,6 +371,28 @@ def validate_args(args, defaults={}):
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
+
+    # Batch size checks if running RL.
+    if args.perform_rl_step:
+        args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
+        num_generated_samples_per_inference_iteration = (
+            args.grpo_samples_per_iteration * args.grpo_iterations)
+
+        # Ensure that the number of prompts we collect is a multiple of the global batch size.
+        # TODO: Make this account for batch size rampup?
+        assert num_generated_samples_per_inference_iteration % args.global_batch_size == 0, \
+            f"grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by global_batch_size"
+
+        # For now only exit/checkpoint on iterations where we generate data. We don't currently
+        # have a way to checkpoint the generated data.
+        num_training_iterations_per_inference_iteration = (
+            num_generated_samples_per_inference_iteration // args.global_batch_size)
+        if args.exit_interval is not None:
+            assert args.exit_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"exit_interval should be divisible by number of global batches per inference iteration."
+        if args.save_interval is not None:
+            assert args.save_interval % num_training_iterations_per_inference_iteration == 0, \
+                f"save_interval should be divisible by number of global batches per inference iteration."
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -1080,8 +1103,15 @@ def validate_args(args, defaults={}):
     if args.delay_wgrad_compute:
         assert args.transformer_impl == 'transformer_engine', \
             "Delaying wgrad compute is only supported with transformer_engine implementation"
-        assert not args.overlap_grad_reduce, \
-            "Delaying wgrad compute is not supported with overlap_grad_reduce"
+        if args.overlap_grad_reduce:
+            assert is_te_min_version("2.7.0"), (
+                "overlap_grad_reduce is only supported with TE >= 2.7.0 when enabling delay_wgrad_compute"
+            )
+        if not args.gradient_accumulation_fusion:
+            assert is_te_min_version("2.7.0"), (
+                "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
+                "when enabling delay_wgrad_compute"
+            )
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
@@ -1299,6 +1329,9 @@ def _add_inference_args(parser):
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
+    group.add_argument('--inference-max-batch-size', type=int, default=None,
+                       help='Maximum batch size for inference.',
+                       dest='inference_max_batch_size')
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
@@ -1348,6 +1381,9 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
+    group.add_argument('--initialize-socket-comms',
+                       action='store_true', default=False,
+                       help='Initialize socket communication for dynamic engine coordinator.')
 
     return parser
 
@@ -1410,7 +1446,7 @@ def _add_network_size_args(parser):
     group.add_argument('--decoder-num-layers', type=int, default=None,
                        help='Number of decoder transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
-                       help='Tansformer hidden size.')
+                       help='Transformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
                        help='Transformer Feed-Forward Network hidden size. '
                        'This is set to 4*hidden-size if not provided')
@@ -1692,6 +1728,11 @@ def _add_logging_args(parser):
                        help='Enable world size logging to tensorboard.')
     group.add_argument('--wandb-project', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
+    group.add_argument('--wandb-entity', type=str, default='',
+                       help='The wandb entity name. It is useful when '
+                       'there are multiple sub-projects in a project. '
+                       'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
+                       'Ignore wandb by default.')    
     group.add_argument('--wandb-exp-name', type=str, default='',
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
@@ -1732,6 +1773,48 @@ def _add_regularization_args(parser):
                        help='Momentum factor for sgd')
     return parser
 
+
+def _add_rl_args(parser):
+    group = parser.add_argument_group(title='rl')
+    group.add_argument('--perform-rl-step', action='store_true',
+                       help="Use the RL training step.")
+    group.add_argument('--rl-prompts-per-eval', type=int, default=32,
+                       help='Number of prompts to evaluate for for each RL task.'
+                        'This evaluation can be very expensive when using environments' 
+                        'that evaluate pass@k so we default to a lower number.')
+    # TODO(rkirby): allow for "complete" evaluation when --rl-prompts-per-eval is set to -1
+    group.add_argument('--grpo-prompts-per-step', type=int, default=32,
+                       help="Number of GRPO groups (G in the paper).")
+    group.add_argument('--grpo-group-size', type=int, default=2,
+                       help="Number of samples per a GRPO group.")
+    group.add_argument('--grpo-iterations', type=int, default=2,
+                       help="Number of iterations per a GRPO implementation.")
+    # As in DAPO, we keep upper/lower eps different.
+    # To have a vanilla GRPO, set them to be the same.
+    group.add_argument('--grpo-clamp-eps-lower', type=float, default=0.01,
+                       help="Lower GRPO clipping bound.")
+    group.add_argument('--grpo-clamp-eps-upper', type=float, default=0.01,
+                       help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
+    group.add_argument('--grpo-kl-beta', type=float, default=0.001,
+                       help="KL term weight in the GRPO loss.")
+    group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
+                       help="Entropy term weight in GRPO loss.")
+    group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
+                       help="Filter groups with same reward.")
+    group.add_argument('--grpo-default-temperature', type=float, default=1.0,
+                       help="Default temperature for model inference.")
+    group.add_argument('--grpo-default-top-p', type=float, default=0,
+                       help="Default top-p for model inference.")
+    group.add_argument('--langrl-inference-server-type', type=str,
+                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
+                       help="Type of inference server to use.")
+    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
+                       help="Conversation template, if using a chat server.")
+    group.add_argument('--langrl-env-config', type=str, default=None,
+                       help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
+                       help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
+    return parser
 
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
@@ -2414,6 +2497,9 @@ def _add_distributed_args(parser):
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
                        'which is improving the performance of the overlapped computation.')
+    group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
+                       default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
+                       'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
     group.add_argument('--use-sharp', action='store_true', 
                        help='Required to enable SHARP communication.')
     group.add_argument('--sharp-enabled-group', type=str, default=None,
@@ -2537,12 +2623,17 @@ def _add_tokenizer_args(parser):
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
+    group.add_argument('--tokenizer-metadata', type=str, default=None,
+                       help='Path to tokenizer metadata in json format.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
                        help='Number of special tokens in tiktoken tokenizer')
     group.add_argument('--tiktoken-special-tokens', type=str, nargs='+', default=None,
-                       help='List of tiktoken special tokens, needs to have ["<unk>", "<s>", "</s>"]')
+                       help='List of tiktoken special tokens, needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
+                       help='To use legacy tokenizer system.')
     group.add_argument("--trust-remote-code", action="store_true",
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
@@ -2614,7 +2705,7 @@ def _add_data_args(parser):
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
+                       help='Reset self attention mask after '
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
@@ -3069,10 +3160,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
             default=None,
             help="Use a default kitchen recipe for all layers as defined by QAT_PARAMS index",
         )
-        return parser
-
-    else:
-        return parser
+    return parser
 
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
