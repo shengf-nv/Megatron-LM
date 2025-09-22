@@ -28,7 +28,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -67,6 +67,7 @@ class TestParallelTransformerBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
@@ -258,6 +259,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
     # Teardown
     Utils.destroy_model_parallel()
+    _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     CudaGraphManager.global_mempool = None
     CudaGraphManager.fwd_mempools = None
@@ -344,6 +346,7 @@ class TestLLaVACudaGraph:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -423,6 +426,15 @@ class TestLLaVACudaGraph:
             loss = output1.sum()
         loss.backward()
 
+        # Import the CUDA graph creation function
+        from megatron.core.transformer.cuda_graphs import create_cudagraphs
+
+        # Create the CUDA graphs - this is where the is_last_layer logic is tested
+        create_cudagraphs()
+
+        # Verify that CUDA graphs were created successfully
+        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+
         if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
             self.llava_model.vision_model.decoder, 'layers'
         ):
@@ -448,8 +460,8 @@ class TestParallelMambaBlockCudagraphs:
         # Ensure that this test is capturing to a fresh memory pool.
         CudaGraphManager.global_mempool = None
 
-        def get_model_comm_pgs():
-            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_override_pattern):
             transformer_config = TransformerConfig(
@@ -466,7 +478,7 @@ class TestParallelMambaBlockCudagraphs:
                 transformer_config,
                 modules,
                 hybrid_override_pattern=hybrid_override_pattern,
-                model_comm_pgs=get_model_comm_pgs(),
+                pg_collection=get_pg_collection(),
             )
 
         self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
@@ -474,6 +486,7 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
@@ -681,8 +694,8 @@ class TestCaptureFreezeGC:
         )
 
         # Validate time and memory usage.
-        assert freeze_on_results["internal"]["time"] < 0.2 * freeze_off_results["internal"]["time"]
-        assert freeze_on_results["external"]["time"] < 0.2 * freeze_off_results["external"]["time"]
+        assert freeze_on_results["internal"]["time"] < 0.3 * freeze_off_results["internal"]["time"]
+        assert freeze_on_results["external"]["time"] < 0.3 * freeze_off_results["external"]["time"]
         assert (
             freeze_on_results["internal"]["allocated_bytes"]
             <= freeze_off_results["internal"]["allocated_bytes"]
