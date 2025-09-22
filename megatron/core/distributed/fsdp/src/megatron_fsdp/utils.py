@@ -670,23 +670,23 @@ class FSDPDistributedIndex:
     def __init__(
         self,
         device_mesh: DeviceMesh,
-        expt_device_mesh: Optional[DeviceMesh] = None,
         dp_shard_dim: Optional[str] = None,
         dp_outer_dim: Optional[str] = None,
         tp_dim: Optional[str] = None,
+        expt_device_mesh: Optional[DeviceMesh] = None,
         hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
     ):
         """
         Args:
             device_mesh (DeviceMesh): The DeviceMesh to use for the DistributedIndex.
-            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
-                to use for the DistributedIndex.
             dp_shard_dim (Optional[str]): The dimension name of the data parallel
                 (and context parallel) sharding sub-mesh.
             dp_outer_dim (Optional[str]): The dimension name of the "outer" data parallel
                 sub-mesh for replication or sharding when using HSDP.
             tp_dim (Optional[str]): The dimension name of the tensor parallel sub-mesh.
+            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
+                to use for the DistributedIndex.
             hybrid_fsdp_group (Optional[torch.distributed.ProcessGroup]): The
                 process group for hybrid FSDP communication, which is the flattened
                 combination of the dp_outer and dp_shard process groups.
@@ -697,10 +697,10 @@ class FSDPDistributedIndex:
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
-        self.expt_device_mesh = expt_device_mesh
         self.dp_shard_dim = dp_shard_dim
         self.dp_outer_dim = dp_outer_dim
         self.tp_dim = tp_dim
+        self.expt_device_mesh = expt_device_mesh
         # Helper flag to denote if we are using hybrid FSDP.
         self.use_hybrid_fsdp = dp_outer_dim is not None
         # Helper flag to denote if we are outer-sharding in hybrid FSDP.

@@ -273,9 +273,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     mesh=mesh.tolist(),
                     mesh_dim_names=["dp_cp", "tp"],
                 ),
-                expt_device_mesh=expt_device_mesh,
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
+                expt_device_mesh=expt_device_mesh,
             )
 
         self.tp_group = tp_group
