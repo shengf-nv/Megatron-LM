@@ -119,15 +119,3 @@ class VocabUtility:
         return VocabUtility.vocab_range_from_per_partition_vocab_size(
             per_partition_vocab_size, rank, world_size
         )
-
-
-def check_sequence_parallel_parameters_consistent(model) -> bool:
-    """Check if the sequence parallel parameters are consistent across the model."""
-    from megatron.core import parallel_state
-    for name, param in model.named_parameters():
-        if getattr(param, "sequence_parallel", False):
-            param_copy = param.detach().clone()
-            torch.distributed.broadcast(param_copy._local_tensor, group=parallel_state.get_tensor_model_parallel_group(), group_src=0)
-            if not torch.equal(param_copy._local_tensor, param._local_tensor):
-                print("Inconsistent parameter found:", name)
-                return False
