@@ -649,8 +649,7 @@ def get_megatron_optimizer(
 
     if dump_param_to_param_group_map is not None:
         torch.distributed.checkpoint.save(
-            state_dict=param_to_param_group,
-            checkpoint_id=dump_param_to_param_group_map,
+            state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
     return ChainedOptimizer(optimizers)

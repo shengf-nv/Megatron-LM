@@ -38,9 +38,9 @@ from .utils import (
     _MODEL_PARALLEL_RNG_TRACKER_NAME,
     FSDPDistributedIndex,
     get_global_memory_buffer,
+    get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
-    get_mcore_tensor_parallel_partition_dim,
 )
 
 logger = logging.getLogger(__name__)
@@ -3714,8 +3714,7 @@ def make_fsdp_dtensor(
     if is_mcore_tensor_model_parallel(param):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
-            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel "
-            "is True."
+            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
         )
 
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
@@ -3726,9 +3725,7 @@ def make_fsdp_dtensor(
                 if force_sync_tp_duplicated_param:
                     if local_tensor.numel() > 0:
                         torch.distributed.broadcast(
-                            local_tensor,
-                            group=tp_mesh.get_group(),
-                            group_src=0,
+                            local_tensor, group=tp_mesh.get_group(), group_src=0
                         )
                 elif run_check:
                     # TODO: Implement consistency check for duplicated TP parameters
@@ -3736,8 +3733,8 @@ def make_fsdp_dtensor(
             else:
                 tp_dim = get_mcore_tensor_parallel_partition_dim(param)
                 assert tp_dim is not None, (
-                    "[Megatron-FSDP] Parameter is not tensor model parallel, yet tensor_model_parallel "
-                    "is True."
+                    "[Megatron-FSDP] Parameter is not tensor model parallel, "
+                    "yet tensor_model_parallel is True."
                 )
                 placements = [Shard(tp_dim)]
                 global_shape[tp_dim] *= tp_mesh.mesh.numel()

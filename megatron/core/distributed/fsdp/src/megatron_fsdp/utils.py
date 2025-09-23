@@ -730,7 +730,8 @@ class FSDPDistributedIndex:
         # Retrieve the expert parallel process groups from the DeviceMesh.
         self.expt_fsdp_group = (
             self.expt_device_mesh[self.dp_shard_dim].get_group()
-            if self.expt_device_mesh is not None and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
+            if self.expt_device_mesh is not None
+            and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
             else None
         )
 
@@ -792,9 +793,7 @@ class FSDPDistributedIndex:
                 )
 
     def get_submesh(
-        self,
-        mesh_dim_names: str | Sequence[str],
-        is_expert_parallel: bool = False,
+        self, mesh_dim_names: str | Sequence[str], is_expert_parallel: bool = False
     ) -> DeviceMesh:
         """
         Retrieve an Megatron-FSDP-registered sub-mesh by name(s).
@@ -803,7 +802,7 @@ class FSDPDistributedIndex:
             mesh_dim_names = (mesh_dim_names,)
         # Search for the sub-mesh in the mesh library.
         if is_expert_parallel:
-            submesh_identifier = tuple([is_expert_parallel, ] + list(mesh_dim_names))
+            submesh_identifier = tuple([is_expert_parallel] + list(mesh_dim_names))
             if submesh_identifier not in self.mesh_library:
                 self.mesh_library[submesh_identifier] = self.expt_device_mesh[tuple(mesh_dim_names)]
             return self.mesh_library[submesh_identifier]
@@ -814,9 +813,10 @@ class FSDPDistributedIndex:
                     # Warn about not specifying tp_dim for
                     # layers or frameworks that depend on this.
                     logger.warning(
-                        "[FSDPDistributedIndex] Note: For TransformerEngine, or other machine learning "
-                        "frameworks like Megatron that assume TP=1, you must specify tp_dim to use "
-                        "Megatron-FSDP. Create a trivial TP dimension by setting the TP dimension size "
+                        "[FSDPDistributedIndex] Note: For TransformerEngine, or "
+                        "other machine learning frameworks like Megatron that assume "
+                        "TP=1, you must specify tp_dim to use Megatron-FSDP. "
+                        "Create a trivial TP dimension by setting the TP dimension size "
                         "to 1 in the DeviceMesh.\n"
                         f"DeviceMesh: {self.device_mesh}"
                     )
@@ -953,10 +953,7 @@ def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel.
     """
-    return (
-        getattr(param, "_mcore_tp", False)
-        or getattr(param, "tensor_model_parallel", False)
-    )
+    return getattr(param, "_mcore_tp", False) or getattr(param, "tensor_model_parallel", False)
 
 
 def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:

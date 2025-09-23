@@ -47,8 +47,8 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
-from ..transformer.module import MegatronModule
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig

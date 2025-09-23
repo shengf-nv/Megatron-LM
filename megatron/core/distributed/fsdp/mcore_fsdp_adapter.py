@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import logging
-from typing import List, Optional
 import random
+from typing import List, Optional
 
 try:
     import einops
@@ -23,9 +23,9 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+import numpy as np
 import torch
 import torch.distributed as dist
-import numpy as np
 
 try:
     from torch.distributed import DeviceMesh
@@ -34,16 +34,15 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.utils import log_single_rank
-from megatron.core import tensor_parallel
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
@@ -216,7 +215,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 outer_fsdp_group = None
                 hybrid_fsdp_group = None
                 expt_dp_group = parallel_state.get_expert_data_parallel_group()
-                ep_group = parallel_state.get_expert_model_parallel_group()                
+                ep_group = parallel_state.get_expert_model_parallel_group()
         else:
             tp_group = getattr(pg_collection, 'tp', None)
             if enable_hsdp:
@@ -231,7 +230,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             tp_group = single_rank_group
-        
+
         if expt_tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
@@ -253,11 +252,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
         else:
             ep_group = parallel_state.get_expert_model_parallel_group()
-            expt_mesh = _get_dp_tp_mesh(
-                expt_dp_group,
-                expt_tp_group,
-                ep_size=ep_group.size()
-            )
+            expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
             expt_device_mesh = DeviceMesh.from_group(
                 [expt_dp_group, expt_tp_group],
                 device_type="cuda",
@@ -300,11 +295,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [_get_rng_state_dict()]
         else:
             broadcast_list = [None]
-        torch.distributed.broadcast_object_list(
-            broadcast_list,
-            group=self.tp_group,
-            group_src=0,
-        )
+        torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
 
 
@@ -367,13 +358,14 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
     tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
     # TODO: Supports configurable (dp, cp, ep, tp) order.
     mesh = einops.rearrange(
-        torch.arange(world_size), "(dp_cp ep tp) -> ep dp_cp tp",
-        dp_cp=dp_cp_group.size(), tp=tp_size, ep=ep_size,
+        torch.arange(world_size),
+        "(dp_cp ep tp) -> ep dp_cp tp",
+        dp_cp=dp_cp_group.size(),
+        tp=tp_size,
+        ep=ep_size,
     )
 
-    mesh_dp_ranks = einops.rearrange(
-        mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size(),
-    )
+    mesh_dp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size())
     dp_cp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_dp_ranks, dp_cp_group_ranks), (
         f"[Megatron-FSDP] Data Parallel ranks in the mesh {mesh_dp_ranks} "
@@ -389,12 +381,10 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
 
     # Exclude the expert parallel dimension
     rank = dist.get_rank()
-    dp_tp_meshes = [
-        per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()
-    ]
-    assert len(dp_tp_meshes) == 1, (
-        f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
-    )
+    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
+    assert (
+        len(dp_tp_meshes) == 1
+    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
     assert len(dp_tp_meshes[0].reshape(-1).tolist()) == dp_cp_group.size() * tp_group.size(), (
         f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
         f"does not match expected size {dp_cp_group.size() * tp_group.size()}."
@@ -423,7 +413,7 @@ def _get_rng_state_dict():
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
         'cuda_rng_state': torch.cuda.get_rng_state(),
-        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
     }
     return rng_state_dict
 

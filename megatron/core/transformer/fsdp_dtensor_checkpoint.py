@@ -19,6 +19,11 @@ import torch.distributed as dist
 from torch.distributed.checkpoint import default_planner
 
 try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed._tensor import DTensor
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+    from torch.distributed.tensor.placement_types import Replicate, Shard
+
     from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
         make_fsdp_dtensor,
     )
@@ -26,15 +31,9 @@ try:
         gather_uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-        is_mcore_tensor_model_parallel,
         get_mcore_tensor_parallel_partition_dim,
+        is_mcore_tensor_model_parallel,
     )
-    from torch.distributed import DeviceMesh
-    from torch.distributed.tensor.placement_types import Replicate, Shard
-    from torch.distributed.checkpoint.metadata import (
-        TensorStorageMetadata,
-    )
-    from torch.distributed._tensor import DTensor
 
     HAVE_MEGATRON_FSDP = True
 except ImportError:
@@ -42,9 +41,8 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
-from megatron.training.global_vars import get_args
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.training.global_vars import get_args
 
 
 def get_ep_layer_offset():
@@ -73,7 +71,8 @@ def get_expert_index_from_key(key):
 
     Supported formats:
     - GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-    - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc2.weight'
+    - SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight',
+        'mlp.experts.local_experts.0.linear_fc2.weight'
 
     Returns:
         int: Expert index if found, None otherwise.
@@ -126,6 +125,8 @@ def handle_experts_in_state_dict(state_dict):
             new_key = key.replace(
                 f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.'
             )
+        else:
+            raise ValueError(f"Unexpected expert key format: {key}")
 
         state_dict[new_key] = state_dict[key]
         del state_dict[key]
@@ -151,17 +152,17 @@ def expert_param_local_key(key):
             new_key = key.replace(f'weight{expert_index}', f'weight{new_expert_index}')
         # SequentialMLP: index is between 'local_experts.' and next '.'
         elif 'mlp.experts.local_experts' in key:
-            new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.')
+            new_key = key.replace(
+                f'local_experts.{expert_index}.', f'local_experts.{new_expert_index}.'
+            )
+        else:
+            raise ValueError(f"Unexpected expert key format: {key}")
         key = new_key
 
     return key
 
 
-def handle_swiglu_in_state_dict(
-    model,
-    model_state_dict,
-    optimizer_state_dict,
-):
+def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
     """
@@ -184,17 +185,21 @@ def handle_swiglu_in_state_dict(
         """
         # Non-expert MLP: 'mlp.linear_fc1.weight', 'mlp.linear_fc1.bias'
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc1.bias0'
-        # SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight', 'mlp.experts.local_experts.0.linear_fc1.bias'
-        return any(re.search(pat, key) for pat in [
-            r"(.*)\.mlp\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.linear_fc1\.bias$",
-            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
-            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
-        ])
+        # SequentialMLP: 'mlp.experts.local_experts.0.linear_fc1.weight',
+        #   'mlp.experts.local_experts.0.linear_fc1.bias'
+        return any(
+            re.search(pat, key)
+            for pat in [
+                r"(.*)\.mlp\.linear_fc1\.weight$",
+                r"(.*)\.mlp\.linear_fc1\.bias$",
+                r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
+                r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
+                r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
+                r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+                r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
+                r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
+            ]
+        )
 
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
@@ -209,7 +214,7 @@ def handle_swiglu_in_state_dict(
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
-            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param,
+            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
         )
         data_size = data.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
@@ -232,9 +237,7 @@ def handle_swiglu_in_state_dict(
         per_tp_rank_shape = list(data.shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
-            assert tp_dim is not None, (
-                "Tensor model parallel dimension not found"
-            )
+            assert tp_dim is not None, "Tensor model parallel dimension not found"
             per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
         linear_fc1_meta = torch.empty(*per_tp_rank_shape, device="meta")
         w_meta, v_meta = torch.chunk(linear_fc1_meta, 2, dim=swiglu_shard_axis)
@@ -288,12 +291,12 @@ def handle_swiglu_in_state_dict(
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :])
-                    )
+                    dist_param = model.get_parameter(expert_param_local_key(key[len("module.") :]))
                     weight_w, weight_v = split_swiglu_linear_fc1(
-                        opt_state_dict[key][subkey], dist_param, swiglu_shard_axis=0,
-                        is_expert_param="mlp.experts" in key
+                        opt_state_dict[key][subkey],
+                        dist_param,
+                        swiglu_shard_axis=0,
+                        is_expert_param="mlp.experts" in key,
                     )
                     # Update the optimizer state dict with the new keys
                     new_opt_state_dict[f"{key}_w"][subkey] = weight_w
@@ -382,9 +385,7 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
         if not isinstance(tensor_metadata, TensorStorageMetadata):
             continue
         if not isinstance(value, DTensor):
-            load_item_dict = {
-                key: torch.empty_like(value)
-            }
+            load_item_dict = {key: torch.empty_like(value)}
         else:
             load_item_dict = {
                 key: torch.distributed.tensor.empty(
@@ -405,17 +406,15 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
         if isinstance(value, DTensor):
             full_value = gather_uneven_dtensor_to_full_tensor(value)
             loaded_tensor = load_item_dict[key].redistribute(
-                placements=[Replicate()] * len(value.placements),
+                placements=[Replicate()] * len(value.placements)
             )
             assert torch.allclose(
                 loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
-            ), (
-                f"key: {key}; {loaded_tensor} {full_value}"
-            )
+            ), f"key: {key}; {loaded_tensor} {full_value}"
         else:
-            assert torch.allclose(value, load_item_dict[key]), (
-                f"key: {key}; {value} {load_item_dict[key]}"
-            )
+            assert torch.allclose(
+                value, load_item_dict[key]
+            ), f"key: {key}; {value} {load_item_dict[key]}"
 
 
 def get_global_unique_param_name(model_chunks, param):
