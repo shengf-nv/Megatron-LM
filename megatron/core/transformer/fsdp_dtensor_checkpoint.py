@@ -275,29 +275,30 @@ def handle_swiglu_in_state_dict(
             model_state_dict[f"{key}_v"] = weight_v
             del model_state_dict[key]
 
-    optimizer_state_dict = optimizer_state_dict.copy()
-    if len(optimizer_state_dict["state"]) != 0:
-        opt_state_dict = optimizer_state_dict["state"]
-        new_opt_state_dict = {}
-        for key in list(opt_state_dict.keys()):
-            # Only process SWIGLU keys
-            if not is_swiglu_key(key):
-                new_opt_state_dict[key] = opt_state_dict[key]
-                continue
-            new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
-            new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-            for subkey in ["exp_avg", "exp_avg_sq"]:
-                dist_param = model.get_parameter(
-                    expert_param_local_key(key[len("module.") :])
-                )
-                weight_w, weight_v = split_swiglu_linear_fc1(
-                    opt_state_dict[key][subkey], dist_param, swiglu_shard_axis=0,
-                    is_expert_param="mlp.experts" in key
-                )
-                # Update the optimizer state dict with the new keys
-                new_opt_state_dict[f"{key}_w"][subkey] = weight_w
-                new_opt_state_dict[f"{key}_v"][subkey] = weight_v
-        optimizer_state_dict["state"] = new_opt_state_dict
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        if len(optimizer_state_dict["state"]) != 0:
+            opt_state_dict = optimizer_state_dict["state"]
+            new_opt_state_dict = {}
+            for key in list(opt_state_dict.keys()):
+                # Only process SWIGLU keys
+                if not is_swiglu_key(key):
+                    new_opt_state_dict[key] = opt_state_dict[key]
+                    continue
+                new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
+                new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
+                for subkey in ["exp_avg", "exp_avg_sq"]:
+                    dist_param = model.get_parameter(
+                        expert_param_local_key(key[len("module.") :])
+                    )
+                    weight_w, weight_v = split_swiglu_linear_fc1(
+                        opt_state_dict[key][subkey], dist_param, swiglu_shard_axis=0,
+                        is_expert_param="mlp.experts" in key
+                    )
+                    # Update the optimizer state dict with the new keys
+                    new_opt_state_dict[f"{key}_w"][subkey] = weight_w
+                    new_opt_state_dict[f"{key}_v"][subkey] = weight_v
+            optimizer_state_dict["state"] = new_opt_state_dict
 
     return model_state_dict, optimizer_state_dict
 

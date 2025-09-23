@@ -717,11 +717,13 @@ def convert_torch_dist_to_fsdp_dtensor(
 
     ckpt_path = Path(input_dir)
     output_dir = Path(output_dir)
+    with open(param_to_param_group_map_json, "r") as f:
+        param_to_param_group_map = json.load(f)
     convert_checkpoint(
         ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
-        param_to_param_group_map=json.loads(param_to_param_group_map_json),
+        param_to_param_group_map=param_to_param_group_map,
     )
 
     click.echo(
@@ -912,7 +914,7 @@ def compare_two_checkpoint(checkpoint_1, checkpoint_2, enable_msc):
 
 @cli.command()
 @click.argument("torch_dcp_dir", type=click.Path(exists=True))
-def print_torch_dcp_in_json(torch_dcp_dir):
+def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
     # Use a temporary file context
     with tempfile.NamedTemporaryFile(suffix=".pth") as tmp_file:
         # Convert distributed checkpoint directory to a single-file checkpoint
@@ -922,6 +924,21 @@ def print_torch_dcp_in_json(torch_dcp_dir):
         state_dict = torch.load(tmp_file.name, map_location="cpu")
 
         click.echo(f"torch dcp content: {json.dumps(state_dict)}")
+
+        # Replace all "module.module." with model_weight_prefix in dict keys
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            new_key = key.replace("module.module.", model_weight_prefix)
+            new_state_dict[new_key] = value
+        
+        # Convert state dict to JSON-serializable format
+        serializable_dict = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in new_state_dict.items()}
+
+        # Save to a JSON file
+        json_file_path = os.path.join(torch_dcp_dir, "param_to_param_group_map111.json")
+        with open(json_file_path, "w") as json_file:
+            json.dump(serializable_dict, json_file, indent=2)
+        click.echo(f"Saved converted param_to_param_group_map to: {json_file_path}")
 
 
 def init_process_group(message):

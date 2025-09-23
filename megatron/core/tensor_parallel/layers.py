@@ -552,6 +552,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
+                # In case of Megatron-FSDP, need to create main grad buffers in-place
+                if hasattr(weight, "__fsdp_param__"):
+                    weight.main_grad = weight.get_main_grad()
+
                 if weight.main_grad.dtype == torch.float32:
                     fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
                         total_input, grad_output, weight.main_grad
@@ -636,7 +640,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     the weight gradients.
 
     In the case of sequence parallelism, the reduce scatter of the
-    input gradients is done asynchronously with the calcluation of the
+    input gradients is done asynchronously with the calculation of the
     weight gradients.
 
     Use of this module requires that the environment variable
@@ -758,7 +762,7 @@ class ColumnParallelLinear(torch.nn.Module):
             returns the master weights used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimations where bias can be fused with other
+            caller. This enables performance optimizations where bias can be fused with other
             elementwise operations.
         skip_weight_param_allocation:
             If True, weight parameter is not allocated and must be passed
@@ -930,11 +934,11 @@ class ColumnParallelLinear(torch.nn.Module):
             )
         )
 
-    def _forward_impl(self, *args, **kwargs):
-        if self.weight is not None and not self.weight.requires_grad:
-            return linear_with_frozen_weight(*args, **kwargs)
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        if not weight.requires_grad:
+            return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(
         self,
@@ -1083,7 +1087,7 @@ class RowParallelLinear(torch.nn.Module):
             used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimations where bias can be fused with other
+            caller. This enables performance optimizations where bias can be fused with other
             elementwise operations.
         is_expert:
             If True, the layer is treated as an MoE expert layer
@@ -1209,11 +1213,11 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
-    def _forward_impl(self, *args, **kwargs):
-        if self.weight is not None and not self.weight.requires_grad:
-            return linear_with_frozen_weight(*args, **kwargs)
+    def _forward_impl(self, input, weight, *args, **kwargs):
+        if not weight.requires_grad:
+            return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
     def forward(self, input_):
         """Forward of RowParallelLinear
