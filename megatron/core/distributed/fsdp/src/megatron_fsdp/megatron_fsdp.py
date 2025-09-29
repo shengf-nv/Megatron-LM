@@ -371,6 +371,8 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
             elif self.bucket_size is not None:
                 suggested_communication_unit_size = self.bucket_size
+            else:
+                suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
             suggested_communication_unit_size = max(
