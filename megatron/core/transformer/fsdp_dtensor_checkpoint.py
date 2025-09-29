@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import re
 
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint import default_planner
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.distributed import DeviceMesh
@@ -352,15 +355,15 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
     only_in_load = list(load_keys - meta_keys)
     in_both = list(meta_keys & load_keys)
 
-    print(f"Keys only in checkpoint metadata_state_dict(first {limit}):")
+    logger.info(f"Keys only in checkpoint metadata_state_dict(first {limit}):")
     for k in sorted(only_in_meta[:limit]):
-        print(f"  {k}")
+        logger.info(f"  {k}")
 
-    print(f"\nKeys only in load_state_dict(first {limit}):")
+    logger.info(f"\nKeys only in load_state_dict(first {limit}):")
     for k in sorted(only_in_load[:limit]):
-        print(f"  {k}")
+        logger.info(f"  {k}")
 
-    print(f"\nKeys in both but with different shapes(first {limit}):")
+    logger.info(f"\nKeys in both but with different shapes(first {limit}):")
     for k in sorted(in_both[:limit]):
         v_meta = state_dict_metadata[k]
         v_load = load_state_dict[k]
@@ -368,7 +371,7 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
         meta_shape = v_meta.size if hasattr(v_meta, "size") else type(v_meta)
         load_shape = v_load.shape if hasattr(v_load, "shape") else type(v_load)
         if meta_shape != load_shape:
-            print(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
+            logger.info(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
 
 
 def validate_loaded_state_dict(state_dict, checkpoint_path):
