@@ -42,13 +42,14 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.training.global_vars import get_args
 
 
 def get_ep_layer_offset():
     """
     Get the expert layer offset for the current model.
     """
+    from megatron.training.global_vars import get_args
+
     args = get_args()
     ep_size = parallel_state.get_expert_model_parallel_world_size()
     ep_rank = parallel_state.get_expert_model_parallel_rank()
@@ -62,6 +63,8 @@ def get_total_num_experts():
     """
     Get the total number of experts for the current model.
     """
+    from megatron.training.global_vars import get_args
+
     args = get_args()
     return args.num_experts if args.num_experts else 0
 
