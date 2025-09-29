@@ -218,6 +218,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 ep_group = parallel_state.get_expert_model_parallel_group()
         else:
             tp_group = getattr(pg_collection, 'tp', None)
+            expt_tp_group = getattr(pg_collection, 'expt_tp', None)
             if enable_hsdp:
                 dp_cp_group = pg_collection.intra_dp_cp
                 outer_fsdp_group = pg_collection.inter_dist_opt
@@ -226,6 +227,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_cp_group = pg_collection.dp_cp
                 outer_fsdp_group = None
                 hybrid_fsdp_group = None
+                expt_dp_group = getattr(pg_collection, 'expt_dp', None)
+                ep_group = getattr(pg_collection, 'ep', None)
 
         if tp_group is None:
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
@@ -251,14 +254,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group=hybrid_fsdp_group,
             )
         else:
-            ep_group = parallel_state.get_expert_model_parallel_group()
-            expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
-            expt_device_mesh = DeviceMesh.from_group(
-                [expt_dp_group, expt_tp_group],
-                device_type="cuda",
-                mesh=expt_mesh.tolist(),
-                mesh_dim_names=["dp_cp", "tp"],
-            )
+            if ep_group is not None:
+                ep_group = parallel_state.get_expert_model_parallel_group()
+                expt_mesh = _get_dp_tp_mesh(
+                    expt_dp_group, expt_tp_group, ep_group_size=ep_group.size()
+                )
+                expt_device_mesh = DeviceMesh.from_group(
+                    [expt_dp_group, expt_tp_group],
+                    device_type="cuda",
+                    mesh=expt_mesh.tolist(),
+                    mesh_dim_names=["dp_cp", "tp"],
+                )
+            else:
+                expt_device_mesh = None
 
             mesh = _get_dp_tp_mesh(dp_cp_group, tp_group)
             dist_index = FSDPDistributedIndex(
@@ -351,18 +359,18 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
     return mesh
 
 
-def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
+def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_group_size=1):
     assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
     world_size = dist.get_world_size()
 
-    tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
+    tp_group_size = dist.get_world_size(tp_group) if tp_group is not None else 1
     # TODO: Supports configurable (dp, cp, ep, tp) order.
     mesh = einops.rearrange(
         torch.arange(world_size),
         "(dp_cp ep tp) -> ep dp_cp tp",
         dp_cp=dp_cp_group.size(),
-        tp=tp_size,
-        ep=ep_size,
+        tp=tp_group_size,
+        ep=ep_group_size,
     )
 
     mesh_dp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size())
@@ -372,7 +380,7 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
         f"do not match the ranks in the DP group {dp_cp_group_ranks}."
     )
 
-    mesh_tp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (dp_cp ep) tp', tp=tp_size)
+    mesh_tp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (dp_cp ep) tp', tp=tp_group_size)
     tp_group_ranks = dist.get_process_group_ranks(tp_group)
     assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
         f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
