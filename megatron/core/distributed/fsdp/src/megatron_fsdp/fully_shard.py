@@ -518,6 +518,7 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        disable_symmetric_registration=disable_symmetric_registration,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.
