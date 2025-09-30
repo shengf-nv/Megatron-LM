@@ -618,19 +618,6 @@ def convert_checkpoint(
                 f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
             ] = ckpt_param_groups[param_group_id]
 
-    # # Move fp32_param to model weights
-    # for key in list(fsdp_dtensor_state_dict.keys()):
-    #     if key.endswith(".fp32_param"):
-    #         wkey = key[:len(key) - len(".fp32_param")]
-    #         wkey = wkey.replace(optimizer_state_prefix, model_weight_prefix)
-    #         v = gather_uneven_dtensor_to_full_tensor(fsdp_dtensor_state_dict[key])
-    #         wv = gather_uneven_dtensor_to_full_tensor(fsdp_dtensor_state_dict[wkey])
-    #         diff = v.to(torch.bfloat16) - wv
-    #         if torch.distributed.get_rank() == 0:
-    #             print(key, diff)
-    #         fsdp_dtensor_state_dict[wkey] = fsdp_dtensor_state_dict[key]
-    #         del fsdp_dtensor_state_dict[key]
-
     if "checkpoint_version" not in fsdp_dtensor_state_dict:
         fsdp_dtensor_state_dict["checkpoint_version"] = 3.0
 
