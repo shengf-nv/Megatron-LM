@@ -255,7 +255,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
         else:
             if ep_group is not None:
-                ep_group = parallel_state.get_expert_model_parallel_group()
                 expt_mesh = _get_dp_tp_mesh(
                     expt_dp_group, expt_tp_group, ep_group_size=ep_group.size()
                 )

@@ -750,11 +750,12 @@ class FSDPDistributedIndex:
         self.mesh_library = {}
 
         def register_submesh(device_mesh, submesh, is_expert_parallel):
-            """Register a submesh with identifier: (*submesh, is_expert_parallel) in the mesh library."""
+            """Register a submesh with identifier: (*submesh, is_expert_parallel)
+            in the mesh library."""
             if contains_submesh(device_mesh, submesh):
                 submesh_identifier = tuple(list(submesh) + [is_expert_parallel])
                 self.mesh_library[submesh_identifier] = device_mesh[submesh]
-        
+
         # Define common submesh patterns
         tp_submesh = (self.tp_dim,)
         hsdp_tp_submesh = (self.dp_outer_dim, self.dp_shard_dim, self.tp_dim)
@@ -762,7 +763,7 @@ class FSDPDistributedIndex:
         hsdp_submesh = (self.dp_outer_dim, self.dp_shard_dim)
         fsdp_submesh = (self.dp_shard_dim,)
 
-        # Register non-EP submeshes 
+        # Register non-EP submeshes
         register_submesh(self.device_mesh, tp_submesh, False)
         register_submesh(self.device_mesh, hsdp_tp_submesh, False)
         register_submesh(self.device_mesh, fsdp_tp_submesh, False)
@@ -806,7 +807,7 @@ class FSDPDistributedIndex:
         """
         if isinstance(mesh_dim_names, str):
             mesh_dim_names = (mesh_dim_names,)
-        
+
         # Construct submesh identifier: (*mesh_dim_names, is_expert_parallel)
         submesh_identifier = tuple(list(mesh_dim_names) + [is_expert_parallel])
 
@@ -833,14 +834,14 @@ class FSDPDistributedIndex:
                     "to 1 in the DeviceMesh.\n"
                     f"DeviceMesh: {self.expt_device_mesh}"
                 )
-            
+
             raise ValueError(
                 f"[FSDPDistributedIndex][get_submesh] No submesh with "
                 f"mesh_dim_names={mesh_dim_names}, is_expert_parallel={is_expert_parallel} "
                 f"has been registered with Megatron-FSDP."
             )
 
-        return device_submesh                
+        return device_submesh
 
     def get_dp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the data parallel process group."""
