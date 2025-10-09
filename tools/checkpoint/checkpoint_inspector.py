@@ -425,9 +425,32 @@ def convert_checkpoint(
                 expert_key = f"{layer_key_parts[0]}.weight{expert_idx}{layer_key_parts[1]}"
             else:
                 raise ValueError(f"Unexpected expert layer key: {layer_key}")
-            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight).reshape(
-                orig_shape[1:] if orig_shape else value.shape[1:]
-            ).redistribute(placements=[Shard(0)])
+
+            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight)
+            expert_shape = orig_shape[1:] if orig_shape else value.shape[1:]
+            # Handle optimizer states for expert linear_fc2 when ETP is enabled
+            if (
+                layer_key.startswith("optimizer.state.")
+                and "linear_fc2" in layer_key
+                and expert_weight.shape[-2] > 1
+            ):
+                tp_size = expert_weight.shape[-2]
+                rows, cols = expert_shape
+                # Reshape to split column dimension by tp_size
+                expert_weight = expert_weight.reshape(
+                    *expert_weight.shape[:-1], rows, cols // tp_size
+                )
+                dims = list(range(expert_weight.ndim))
+                dims[-3], dims[-2] = dims[-2], dims[-3]
+                expert_weight = (
+                    expert_weight.permute(*dims)
+                    .reshape(expert_shape)
+                    .redistribute(placements=[Shard(0)])
+                )
+            else:
+                expert_weight = expert_weight.reshape(expert_shape).redistribute(
+                    placements=[Shard(0)]
+                )
             experts[expert_key] = expert_weight
         return experts
 
@@ -506,9 +529,26 @@ def convert_checkpoint(
                 split_tensors = split_expert_weights(new_key, value, orig_shape)
             else:
                 if orig_shape:
-                    value = gather_uneven_dtensor_to_full_tensor(value).reshape(
-                        orig_shape
-                    ).redistribute(placements=[Shard(0)])
+                    value = gather_uneven_dtensor_to_full_tensor(value)
+                    # Handle optimizer states with partition_dim=1 when TP is enabled
+                    if (
+                        new_key.startswith("optimizer.state.")
+                        and value.ndim > 2
+                        and value.shape[-2] > 1
+                    ):
+                        tp_size = value.shape[-2]
+                        rows, cols = orig_shape
+                        # Reshape to split column dimension by tp_size
+                        value = value.reshape(*value.shape[:-1], rows, cols // tp_size)
+                        dims = list(range(value.ndim))
+                        dims[-3], dims[-2] = dims[-2], dims[-3]
+                        value = (
+                            value.permute(*dims)
+                            .reshape(orig_shape)
+                            .redistribute(placements=[Shard(0)])
+                        )
+                    else:
+                        value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
             # Handle SWiGLU weights
