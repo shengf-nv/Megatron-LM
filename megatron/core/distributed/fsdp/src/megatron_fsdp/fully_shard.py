@@ -63,8 +63,8 @@ def fully_shard_model(
     dp_shard_dim: str,
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
-    expt_device_mesh: Optional[DeviceMesh] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -182,12 +182,12 @@ def fully_shard_model(
         # required for Megatron, TransformerEngine (default TP=1), and strided
         # sharding when using DTensor-based TP.
         tp_dim=tp_dim,
-        # Only required for Megatron-FSDP + EP.
-        expt_device_mesh=expt_device_mesh,
         # Only required for HSDP.
         hybrid_fsdp_group=hybrid_fsdp_group,
-        # Access to flattened DP rank assignments for HFSDP.
+        # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
+        # Only required for Megatron-FSDP + EP.
+        expt_device_mesh=expt_device_mesh,
     )
 
     # Wrap model in Megatron FSDP.
@@ -321,8 +321,8 @@ def fully_shard(
     dp_shard_dim: str,
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
-    expt_device_mesh: Optional[DeviceMesh] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -379,13 +379,13 @@ def fully_shard(
             Defaults to None. Required if TP is used in the model, or if TransformerEngine
             layers are utilized, as TE defaults to "TP=1".
 
-        expt_device_mesh (Optional[DeviceMesh]):
-            Expert parallel device mesh object defining the topology for MoE distributed training.
-
         hybrid_fsdp_group (Optional[torch.distributed.ProcessGroup]):
             Cumulative data parallel process group for hybrid FSDP that can be manufactured
             by flattening the outer-FSDP (dp_outer_dim) and FSDP (dp_shard_dim) process groups
             or sub-meshes. Defaults to None. Required for HSDP, i.e. if dp_outer_dim is not None.
+
+        expt_device_mesh (Optional[DeviceMesh]):
+            Expert parallel device mesh object defining the topology for MoE distributed training.
 
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
@@ -498,8 +498,8 @@ def fully_shard(
         dp_shard_dim=dp_shard_dim,
         dp_outer_dim=dp_outer_dim,
         tp_dim=tp_dim,
-        expt_device_mesh=expt_device_mesh,
         hybrid_fsdp_group=hybrid_fsdp_group,
+        expt_device_mesh=expt_device_mesh,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,

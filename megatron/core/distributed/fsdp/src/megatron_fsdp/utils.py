@@ -673,9 +673,9 @@ class FSDPDistributedIndex:
         dp_shard_dim: Optional[str] = None,
         dp_outer_dim: Optional[str] = None,
         tp_dim: Optional[str] = None,
-        expt_device_mesh: Optional[DeviceMesh] = None,
         hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
+        expt_device_mesh: Optional[DeviceMesh] = None,
     ):
         """
         Args:
@@ -685,8 +685,6 @@ class FSDPDistributedIndex:
             dp_outer_dim (Optional[str]): The dimension name of the "outer" data parallel
                 sub-mesh for replication or sharding when using HSDP.
             tp_dim (Optional[str]): The dimension name of the tensor parallel sub-mesh.
-            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
-                to use for the DistributedIndex.
             hybrid_fsdp_group (Optional[torch.distributed.ProcessGroup]): The
                 process group for hybrid FSDP communication, which is the flattened
                 combination of the dp_outer and dp_shard process groups.
@@ -694,17 +692,19 @@ class FSDPDistributedIndex:
                 in hybrid FSDP. Specifying outer sharding will lift the bucket sharding
                 coordinate system to flattened ranks of (dp_shard, dp_outer) instead of
                 just sharding across dp_shard ranks and replicating across dp_outer ranks.
+            expt_device_mesh (Optional[DeviceMesh]): The expert parallel device mesh
+                to use for the DistributedIndex.
         """
         # Device mesh arguments.
         self.device_mesh = device_mesh
         self.dp_shard_dim = dp_shard_dim
         self.dp_outer_dim = dp_outer_dim
         self.tp_dim = tp_dim
-        self.expt_device_mesh = expt_device_mesh
         # Helper flag to denote if we are using hybrid FSDP.
         self.use_hybrid_fsdp = dp_outer_dim is not None
         # Helper flag to denote if we are outer-sharding in hybrid FSDP.
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
+        self.expt_device_mesh = expt_device_mesh
 
         # Handling the situation where M-Core MoE EP=1
         if self.expt_device_mesh is None:
