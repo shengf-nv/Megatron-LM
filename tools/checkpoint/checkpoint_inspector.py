@@ -955,14 +955,14 @@ def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
         # Replace all "module.module." with model_weight_prefix in dict keys
         new_state_dict = {}
         for key, value in state_dict.items():
-            new_key = key.replace("module.module.", model_weight_prefix)
+            new_key = key.replace("module.module", model_weight_prefix)
             new_state_dict[new_key] = value
         
         # Convert state dict to JSON-serializable format
         serializable_dict = {k: v.tolist() if hasattr(v, "tolist") else v for k, v in new_state_dict.items()}
 
         # Save to a JSON file
-        json_file_path = os.path.join(torch_dcp_dir, "param_to_param_group_map111.json")
+        json_file_path = os.path.join(torch_dcp_dir, "param_to_param_group_map.json")
         with open(json_file_path, "w") as json_file:
             json.dump(serializable_dict, json_file, indent=2)
         click.echo(f"Saved converted param_to_param_group_map to: {json_file_path}")
