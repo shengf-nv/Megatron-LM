@@ -993,12 +993,16 @@ class MegatronFSDP(torch.nn.Module):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
+        logger.info("SHENGFU 1")
         if not self.ddp_config.overlap_grad_reduce:
+            logger.info("SHENGFU 2")
             if self.data_parallel_sharding_strategy == "no_shard":
+                logger.info("SHENGFU 3")
                 self.param_and_grad_buffer.all_reduce_gradients(
                     async_op=self.ddp_config.overlap_grad_reduce
                 )
             else:
+                logger.info("SHENGFU 4")
                 self.param_and_grad_buffer.reduce_scatter_gradients()
 
     def synchronize_param_gather(self):

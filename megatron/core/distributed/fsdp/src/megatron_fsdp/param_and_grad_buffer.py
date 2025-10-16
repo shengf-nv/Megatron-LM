@@ -829,6 +829,9 @@ class DataParallelBuffer:
         self.dtype = dtype if dtype else next(iter(_param_dtype))
         self.device = device
         self.data_parallel_group = data_parallel_group
+        ranks = list(torch.distributed.get_process_group_ranks(data_parallel_group))
+        backend = torch.distributed.get_backend(data_parallel_group)
+        self.rs_data_parallel_group = torch.distributed.new_group(ranks=ranks, backend=backend)
         # NOTE: Specifying dp_rank is a tricky thing. Currently, only full-shard
         # hybrid FSDP needs to do this to set dp rank that is different from the group rank.
         if dp_rank is not None:
@@ -1735,6 +1738,7 @@ class ParamAndGradBuffer:
         """
         # FSDP Sharding Strategy: no-shard, optim, optim_grads, optim_grads_params
         data_parallel_sharding_strategy = self.ddp_config.data_parallel_sharding_strategy
+        logger.info(f"SHENGFU data_parallel_sharding_strategy = {data_parallel_sharding_strategy}")
         if data_parallel_sharding_strategy == "no_shard":
             is_model_weight_buffer_distributed = False
             is_main_weight_buffer_distributed = False
@@ -2585,6 +2589,7 @@ class ParamAndGradBuffer:
         all_gather_ops = []
         for g in self.parameter_groups:
             shard = g.model_weight_buffer.get_shard_from_local_buffer()
+            logger.info("SHENGFU ParamGradBuffer all_gather_parameters all_gather_into_tensor")
             all_gather_handler = torch.distributed.all_gather_into_tensor(
                 output_tensor=g.model_weight_buffer.data,
                 input_tensor=shard,
@@ -2617,11 +2622,12 @@ class ParamAndGradBuffer:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            logger.info("SHENGFU ParamAndGradBuffer reduce_scatter_gradients reduce_scatter_tensor")
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
                 output=gbuf.get_shard_from_local_buffer(),
                 input=gbuf.data,
                 op=reduce_op,
-                group=g.main_grad_buffer.data_parallel_group,
+                group=g.main_grad_buffer.rs_data_parallel_group,
                 async_op=async_op,
             )
 
@@ -2655,6 +2661,7 @@ class ParamAndGradBuffer:
                 continue
             scaling_factor = gbuf.gradient_scaling_factor
             reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            logger.info("SHENGFU ParamAndGradBuffer all_reduce_gradients")
             all_reduce_handler = torch.distributed.all_reduce(
                 gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
             )
@@ -2916,6 +2923,7 @@ class GradReducePipeline:
                     if not gbuf.is_data_distributed:
                         # All-reduce the gradients on every rank. No scattering
                         # or sharding necessary.
+                        logger.info("SHENGFU GradReducePipeline _bucket_group_gradient_reduce all_reduce")
                         torch.distributed.all_reduce(
                             bucket.data, op=reduce_op, group=gbuf.data_parallel_group
                         )
@@ -2932,11 +2940,12 @@ class GradReducePipeline:
                         if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
                         # Reduce-scatter gradients on the FSDP group.
+                        logger.info("SHENGFU GradReducePipeline _bucket_group_gradient_reduce reduce_scatter_tensor")
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,
                             input=bucket.data,
                             op=reduce_op,
-                            group=gbuf.data_parallel_group,
+                            group=gbuf.rs_data_parallel_group,
                         )
                         reduced_grad.append(grad_shard)
                         grad_buffer.append(gbuf.get_shard_from_local_buffer())
@@ -2981,6 +2990,7 @@ class GradReducePipeline:
                             reduced_grad.append(grad_full_shard)
                             # Reduce-scatter the FSDP gradient buffer shard further
                             # into the (DP-Outer, DP-Shard) gradient shard.
+                            logger.info("SHENGFU GradReducePipeline _bucket_group_gradient_reduce reduce_scatter_tensor OuterDP group")
                             torch.distributed.reduce_scatter_tensor(
                                 output=grad_full_shard,
                                 input=gbuf.data,
@@ -2990,6 +3000,7 @@ class GradReducePipeline:
                         else:
                             # No outer-DP sharding, so just all-reduce the FSDP gradient
                             # buffer shard into itself.
+                            logger.info("SHENGFU GradReducePipeline _bucket_group_gradient_reduce all_reduce")
                             torch.distributed.all_reduce(
                                 gbuf.data, group=outer_fsdp_group, op=reduce_op
                             )
@@ -3262,6 +3273,7 @@ class AllGatherPipeline:
                             # main weight buffer into the (DP-Shard)-backed hybrid weight buffer.
                             wbuf = self.buffer.parameter_groups[bucket_id].model_weight_buffer
                             hsdp_wbuf = self.buffer.parameter_groups[bucket_id].hsdp_wbuf
+                            logger.info("SHENGFU AllGatherPipeline all_gather_params all_gather_into_tensor")
                             torch.distributed.all_gather_into_tensor(
                                 output_tensor=hsdp_wbuf.data,
                                 input_tensor=wbuf.data,
@@ -3357,6 +3369,7 @@ class AllGatherPipeline:
         bucket = wbuf.fetch_bucket(set_param_data=True)
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
+        logger.info("SHENGFU AllGatherPipeline async_bucket_gather all_gather_into_tensor")
         param_gather_event = torch.distributed.all_gather_into_tensor(
             output_tensor=bucket.data,
             input_tensor=wbuf.get_shard_from_local_buffer(),
