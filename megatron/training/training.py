@@ -2139,7 +2139,7 @@ def train(
                 worker_name=f"kineto-trace-{torch.distributed.get_rank()}.json",
                 use_gzip=True),
             execution_trace_observer=(
-                torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+                torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/rank-{torch.distributed.get_rank()}.json")
             ),
             record_shapes=True,
             with_stack=True,
