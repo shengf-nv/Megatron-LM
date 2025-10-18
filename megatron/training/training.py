@@ -2123,11 +2123,15 @@ def train(
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     prof = None
+    et_observer = None
     if (
         args.profile
         # and torch.distributed.get_rank() in args.profile_ranks
         and args.use_pytorch_profiler
     ):
+        et_observer=(
+                torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+        )
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
@@ -2138,9 +2142,6 @@ def train(
             on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir, 
                 worker_name=f"kineto-trace-{torch.distributed.get_rank()}.json",
                 use_gzip=True),
-            execution_trace_observer=(
-                torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/rank-{torch.distributed.get_rank()}.json")
-            ),
             record_shapes=True,
             with_stack=True,
         )
@@ -2182,7 +2183,15 @@ def train(
         # if args.profile and torch.distributed.get_rank() in args.profile_ranks:
         if args.profile:
             if args.use_pytorch_profiler:
+                if iteration == 2:
+                    et_observer.start()
+
                 prof.step()
+
+                if iteration == 3:
+                    et_observer.stop()
+                    et_observer.cleanup()
+                    
             elif iteration == args.profile_step_start:
                 torch.cuda.cudart().cudaProfilerStart()
                 torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
