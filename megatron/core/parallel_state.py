@@ -778,12 +778,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
-        dummy_input_ag  = torch.ones(1, device=local_device)
+        dummy_input_ag  = torch.ones(1, device=local_device, dtype=torch.float32)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
-        torch.distributedall_gather(
+        torch.distributed.all_gather(
                 dummy_output_ag,
                 dummy_input_ag,
-                group=pg_ag,
+                group=group_with_cp,
                 async_op=True
             ) 
 
@@ -799,13 +799,13 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP_RS",
         )
-        dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
+        dummy_input_rs = list(torch.ones(world_size, device=local_device, dtype=torch.float32).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
-        torch.distributedreduce_scatter(
+        torch.distributed.reduce_scatter(
                 output=dummy_output_rs,
                 input_list=dummy_input_rs,
-                group=pg_rs,
-                op=torch.distributedReduceOp.SUM,
+                group=group_with_cp_rs,
+                op=torch.distributed.ReduceOp.SUM,
                 async_op=True
             ) 
 
@@ -1212,12 +1212,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
             group_desc="EXPERT_DATA_PARALLEL_GROUP",
         )
-        dummy_input_ag  = torch.ones(1, device=local_device)
+        dummy_input_ag  = torch.ones(1, device=local_device, dtype=torch.float32)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
-        torch.distributedall_gather(
+        torch.distributed.all_gather(
                 dummy_output_ag,
                 dummy_input_ag,
-                group=pg_ag,
+                group=group,
                 async_op=True
             ) 
 
@@ -1232,13 +1232,13 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
             group_desc="EXPERT_DATA_PARALLEL_GROUP_RS",
         )
-        dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
+        dummy_input_rs = list(torch.ones(world_size, device=local_device, dtype=torch.float32).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
-        torch.distributedreduce_scatter(
+        torch.distributed.reduce_scatter(
                 output=dummy_output_rs,
                 input_list=dummy_input_rs,
-                group=pg_rs,
-                op=torch.distributedReduceOp.SUM,
+                group=group_rs,
+                op=torch.distributed.ReduceOp.SUM,
                 async_op=True
             ) 
 

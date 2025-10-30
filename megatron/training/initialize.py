@@ -333,7 +333,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
 
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        dummy = torch.zeros(1, device=device_id)
+        torch.distributed.all_reduce(dummy, op=torch.distributed.ReduceOp.SUM, async_op=True)        
+
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
