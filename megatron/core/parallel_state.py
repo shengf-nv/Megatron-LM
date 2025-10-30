@@ -780,7 +780,7 @@ def initialize_model_parallel(
         )
         dummy_input_ag  = torch.ones(1, device=local_device)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
-        dist.all_gather(
+        torch.distributedall_gather(
                 dummy_output_ag,
                 dummy_input_ag,
                 group=pg_ag,
@@ -801,11 +801,11 @@ def initialize_model_parallel(
         )
         dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
-        dist.reduce_scatter(
+        torch.distributedreduce_scatter(
                 output=dummy_output_rs,
                 input_list=dummy_input_rs,
                 group=pg_rs,
-                op=dist.ReduceOp.SUM,
+                op=torch.distributedReduceOp.SUM,
                 async_op=True
             ) 
 
@@ -1214,7 +1214,7 @@ def initialize_model_parallel(
         )
         dummy_input_ag  = torch.ones(1, device=local_device)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
-        dist.all_gather(
+        torch.distributedall_gather(
                 dummy_output_ag,
                 dummy_input_ag,
                 group=pg_ag,
@@ -1234,11 +1234,11 @@ def initialize_model_parallel(
         )
         dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
-        dist.reduce_scatter(
+        torch.distributedreduce_scatter(
                 output=dummy_output_rs,
                 input_list=dummy_input_rs,
                 group=pg_rs,
-                op=dist.ReduceOp.SUM,
+                op=torch.distributedReduceOp.SUM,
                 async_op=True
             ) 
 
