@@ -54,6 +54,7 @@ _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = None
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
+_EXPERT_DATA_PARALLEL_GROUP_RS = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
@@ -108,6 +109,7 @@ _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
+_DATA_PARALLEL_GROUP_WITH_CP_RS = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -646,6 +648,9 @@ def initialize_model_parallel(
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_device = torch.device("cuda", local_rank)
+
     model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
 
     if world_size % model_size != 0:
@@ -734,6 +739,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
+    global _DATA_PARALLEL_GROUP_WITH_CP_RS    
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -759,12 +765,50 @@ def initialize_model_parallel(
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
     for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+        # For all gather
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        os.environ["SHARP_COLL_ENABLE_MCAST"] ="1"
+        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="1"
+        os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
+        os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
+        os.environ["NCCL_ALGO"]="collnetdirect" 
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
+        dummy_input_ag  = torch.ones(1, device=local_device)
+        dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
+        dist.all_gather(
+                dummy_output_ag,
+                dummy_input_ag,
+                group=pg_ag,
+                async_op=True
+            ) 
+
+        # for reduce scatter
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        os.environ["SHARP_COLL_ENABLE_MCAST"] ="0"
+        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
+        os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
+        os.environ["NCCL_ALGO"]="collnetdirect" 
+        group_with_cp_rs = create_group(
+            ranks_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+            group_desc="DATA_PARALLEL_GROUP_WITH_CP_RS",
+        )
+        dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
+        dummy_output_rs = torch.empty_like(dummy_input_rs[0])
+        dist.reduce_scatter(
+                output=dummy_output_rs,
+                input_list=dummy_input_rs,
+                group=pg_rs,
+                op=dist.ReduceOp.SUM,
+                async_op=True
+            ) 
+
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -776,6 +820,7 @@ def initialize_model_parallel(
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+            _DATA_PARALLEL_GROUP_WITH_CP_RS = group_with_cp_rs
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -1130,6 +1175,8 @@ def initialize_model_parallel(
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
+    global _EXPERT_DATA_PARALLEL_GROUP_RS
+    assert _EXPERT_DATA_PARALLEL_GROUP_RS is None, "Expert data group for reduce scatter is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -1153,12 +1200,48 @@ def initialize_model_parallel(
     )
 
     for ranks in expert_decoder_rank_generator.get_ranks('dp'):
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        os.environ["SHARP_COLL_ENABLE_MCAST"] ="1"
+        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="1"
+        os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
+        os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
+        os.environ["NCCL_ALGO"]="collnetdirect" 
         group = create_group(
             ranks,
             timeout=timeout,
             pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
             group_desc="EXPERT_DATA_PARALLEL_GROUP",
         )
+        dummy_input_ag  = torch.ones(1, device=local_device)
+        dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
+        dist.all_gather(
+                dummy_output_ag,
+                dummy_input_ag,
+                group=pg_ag,
+                async_op=True
+            ) 
+
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        os.environ["SHARP_COLL_ENABLE_MCAST"] ="0"
+        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
+        os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
+        os.environ["NCCL_ALGO"]="collnetdirect" 
+        group_rs = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+            group_desc="EXPERT_DATA_PARALLEL_GROUP_RS",
+        )
+        dummy_input_rs = list(torch.ones(world_size, device=local_device).chunk(world_size))
+        dummy_output_rs = torch.empty_like(dummy_input_rs[0])
+        dist.reduce_scatter(
+                output=dummy_output_rs,
+                input_list=dummy_input_rs,
+                group=pg_rs,
+                op=dist.ReduceOp.SUM,
+                async_op=True
+            ) 
+
         if create_gloo_process_groups:
             group_gloo = create_group(
                 ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
@@ -1167,6 +1250,8 @@ def initialize_model_parallel(
             group_gloo = None
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
+            _EXPERT_DATA_PARALLEL_GROUP_RS = group_rs
+
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
         if num_distributed_optimizer_instances > 1:

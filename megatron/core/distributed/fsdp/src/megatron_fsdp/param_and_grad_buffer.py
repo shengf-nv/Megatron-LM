@@ -2857,11 +2857,23 @@ class GradReducePipeline:
                         # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
                         if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
+                            
+                        # Reduce-scatter gradients on the FSDP group.
+                        # logger.info("SHENGFU GradReducePipeline _bucket_group_gradient_reduce reduce_scatter_tensor")
+                        if gbuf.data_parallel_group.group_desc == 'EXPERT_DATA_PARALLEL_GROUP':
+                            import megatron.core.parallel_state as parallel_state
+                            my_group = parallel_state._EXPERT_DATA_PARALLEL_GROUP_RS
+                        elif gbuf.data_parallel_group.group_desc == 'DATA_PARALLEL_GROUP_WITH_CP':
+                            import megatron.core.parallel_state as parallel_state
+                            my_group = parallel_state._DATA_PARALLEL_GROUP_WITH_CP_RS
+                        else:
+                            my_group = gbuf.data_parallel_group
+
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,
                             input=bucket.data,
                             op=reduce_op,
-                            group=gbuf.data_parallel_group,
+                            group=my_group
                         )
                         reduced_grad.append(grad_shard)
                         grad_buffer.append(gbuf.get_shard_from_local_buffer())
