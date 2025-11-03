@@ -54,7 +54,7 @@ _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = None
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
-_EXPERT_DATA_PARALLEL_GROUP_RS = None
+_EXPERT_DATA_PARALLEL_GROUP_AG = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
@@ -109,7 +109,7 @@ _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
-_DATA_PARALLEL_GROUP_WITH_CP_RS = None
+_DATA_PARALLEL_GROUP_WITH_CP_AG = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -739,7 +739,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
-    global _DATA_PARALLEL_GROUP_WITH_CP_RS    
+    global _DATA_PARALLEL_GROUP_WITH_CP_AG 
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -771,6 +771,7 @@ def initialize_model_parallel(
         os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="1"
         os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
         os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
+        os.environ["SHARP_COLL_NUM_MCAST_TREES" ] ="1"
         #os.environ["NCCL_ALGO"]="collnetdirect" 
         group_with_cp = create_group(
             ranks_with_cp,
@@ -792,6 +793,7 @@ def initialize_model_parallel(
         os.environ["SHARP_COLL_ENABLE_MCAST"] ="0"
         os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
         os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
+        os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="1"
         #os.environ["NCCL_ALGO"]="collnetdirect" 
         group_with_cp_rs = create_group(
             ranks_with_cp,
@@ -819,8 +821,8 @@ def initialize_model_parallel(
         else:
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
-            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_RS = group_with_cp_rs
+            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp_rs
+            _DATA_PARALLEL_GROUP_WITH_CP_AG = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -1175,8 +1177,8 @@ def initialize_model_parallel(
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
     assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
-    global _EXPERT_DATA_PARALLEL_GROUP_RS
-    assert _EXPERT_DATA_PARALLEL_GROUP_RS is None, "Expert data group for reduce scatter is already initialized"
+    global _EXPERT_DATA_PARALLEL_GROUP_AG
+    assert _EXPERT_DATA_PARALLEL_GROUP_AG is None, "Expert data group for all gather is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
@@ -1200,11 +1202,11 @@ def initialize_model_parallel(
     )
 
     for ranks in expert_decoder_rank_generator.get_ranks('dp'):
-        os.environ["NCCL_COLLNET_ENABLE"] = "1"
-        os.environ["SHARP_COLL_ENABLE_MCAST"] ="1"
-        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="1"
-        os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
-        os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"
+        #os.environ["SHARP_COLL_ENABLE_MCAST"] ="1"
+        #os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="1"
+        #os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
+        #os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
         #os.environ["NCCL_ALGO"]="collnetdirect" 
         group = create_group(
             ranks,
@@ -1221,10 +1223,10 @@ def initialize_model_parallel(
                 async_op=True
             ) 
 
-        os.environ["NCCL_COLLNET_ENABLE"] = "1"
-        os.environ["SHARP_COLL_ENABLE_MCAST"] ="0"
-        os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
-        os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
+        #os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        #os.environ["SHARP_COLL_ENABLE_MCAST"] ="0"
+        #os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
+        #os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
         #os.environ["NCCL_ALGO"]="collnetdirect" 
         group_rs = create_group(
             ranks,
@@ -1249,8 +1251,8 @@ def initialize_model_parallel(
         else:
             group_gloo = None
         if rank in ranks:
-            _EXPERT_DATA_PARALLEL_GROUP = group
-            _EXPERT_DATA_PARALLEL_GROUP_RS = group_rs
+            _EXPERT_DATA_PARALLEL_GROUP = group_rs
+            _EXPERT_DATA_PARALLEL_GROUP_AG = group
 
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
