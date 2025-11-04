@@ -777,7 +777,7 @@ def initialize_model_parallel(
             ranks_with_cp,
             timeout=timeout,
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+            group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
         )
         dummy_input_ag  = torch.ones(1, device=local_device, dtype=torch.float32)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
@@ -799,7 +799,7 @@ def initialize_model_parallel(
             ranks_with_cp,
             timeout=timeout,
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP_WITH_CP_RS",
+            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
         dummy_input_rs = list(torch.ones(world_size, device=local_device, dtype=torch.float32).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
@@ -1212,7 +1212,7 @@ def initialize_model_parallel(
             ranks,
             timeout=timeout,
             pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
-            group_desc="EXPERT_DATA_PARALLEL_GROUP",
+            group_desc="EXPERT_DATA_PARALLEL_GROUP_AG",
         )
         dummy_input_ag  = torch.ones(1, device=local_device, dtype=torch.float32)
         dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
@@ -1232,7 +1232,7 @@ def initialize_model_parallel(
             ranks,
             timeout=timeout,
             pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
-            group_desc="EXPERT_DATA_PARALLEL_GROUP_RS",
+            group_desc="EXPERT_DATA_PARALLEL_GROUP",
         )
         dummy_input_rs = list(torch.ones(world_size, device=local_device, dtype=torch.float32).chunk(world_size))
         dummy_output_rs = torch.empty_like(dummy_input_rs[0])
