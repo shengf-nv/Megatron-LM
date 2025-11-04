@@ -772,7 +772,6 @@ def initialize_model_parallel(
         os.environ["SHARP_COLL_ENABLE_SAT"]     ="0"
         os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="5"
         os.environ["SHARP_COLL_NUM_MCAST_TREES" ] ="1"
-        #os.environ["NCCL_ALGO"]="collnetdirect" 
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -794,7 +793,6 @@ def initialize_model_parallel(
         os.environ["SHARP_COLL_JOB_REQUEST_MC"] ="0"
         os.environ["SHARP_COLL_ENABLE_SAT"]     ="1"
         os.environ["SHARP_COLL_ALLGATHER_ALG" ] ="1"
-        #os.environ["NCCL_ALGO"]="collnetdirect" 
         group_with_cp_rs = create_group(
             ranks_with_cp,
             timeout=timeout,
