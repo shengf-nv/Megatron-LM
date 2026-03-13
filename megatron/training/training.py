@@ -2034,7 +2034,7 @@ def post_training_step_callbacks(
                 prof.stop()
                 if prof.execution_trace_observer is not None:
                     prof.execution_trace_observer.unregister_callback()
-            else:
+            elif iteration < args.profile_step_end:
                 prof.step()
         elif iteration == args.profile_step_end:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
@@ -2383,7 +2383,8 @@ def train(
         if args.pytorch_profiler_collect_chakra:
             et_dir = Path(f"{args.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
-            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json")
+            et.set_extra_resource_collection(True)
         else:
             et = None
         def trace_handler(p):
