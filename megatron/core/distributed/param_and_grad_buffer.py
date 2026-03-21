@@ -733,6 +733,7 @@ class _ParamAndGradBuffer:
         self.param_data = None
 
         if self.nccl_ub:
+            print("nccl user buffer is enabled", flush=True)
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
@@ -745,6 +746,7 @@ class _ParamAndGradBuffer:
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
         else:
+            print("nccl user buffer is disabled", flush=True)
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
 

@@ -2402,6 +2402,7 @@ def train(
             record_shapes=args.pytorch_profiler_collect_shapes,
             with_stack=args.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
+            expeirmental_config=torch.profiler._ExperimentalConfig(enable_cuda_sync_events=True)
         )
         prof.start()
 
