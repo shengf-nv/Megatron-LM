@@ -2701,6 +2701,19 @@ def setup_model_and_optimizer(
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
+            if args.create_all_gather_group:
+                timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+                dp_cp_ag, expt_dp_ag = create_all_gather_groups(
+                    for_expert_parallelism=(args.expert_model_parallel_size > 1),
+                    timeout=timeout,
+                )
+                pg_collection.dp_cp_ag = dp_cp_ag
+                pg_collection.expt_dp_ag = expt_dp_ag
+
+                print_rank_0("> created all-gather process groups for AG/RS overlap")
+                if expt_dp_ag is not None:
+                    print_rank_0(">   including expert parallelism AG group")
+
             # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
             # and skips grad-buffer allocation for all params (matching get_model behavior).
             if args.freeze_all_layers:
