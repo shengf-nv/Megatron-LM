@@ -5,9 +5,11 @@
 import logging
 import os
 import warnings
+from contextlib import contextmanager
 from datetime import timedelta
+from enum import Enum
 from math import log2
-from typing import Callable, List, Optional
+from typing import Callable, Dict, Iterator, List, Mapping, Optional
 
 import numpy as np
 import torch
@@ -17,6 +19,27 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
+
+class SHARP_MODE (Enum):
+    DISABLE_NVLINK            = 0
+    DISABLE_NVLINK_WITH_SHARP = 1
+
+sharp_mode : SHARP_MODE = SHARP_MODE.DISABLE_NVLINK_WITH_SHARP
+
+@contextmanager
+def temporary_environ(updates: Mapping[str, str]) -> Iterator[None]:
+    """Apply ``updates`` to :data:`os.environ` for the duration of the context, then restore."""
+    previous: Dict[str, Optional[str]] = {key: os.environ.get(key) for key in updates}
+    try:
+        os.environ.update(updates)
+        yield
+    finally:
+        for key in updates:
+            old = previous[key]
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 
 try:
     import einops
@@ -801,6 +824,9 @@ def initialize_model_parallel(
         local_world_size if local_world_size is not None else torch.distributed.get_world_size()
     )
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_device = torch.device("cuda", local_rank)
+
     # GTP_remat requires a single distributed-optimizer instance: partial-distopt sharding of the
     # data domain would need gtp_remat-aware sizing. Assert early so all group builds below can
     # assume one instance when GTP_remat/EGTP is active.
@@ -960,12 +986,22 @@ def initialize_model_parallel(
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
     for ranks_with_cp in decoder_rank_generator.get_ranks("dp-cp"):
-        group_with_cp = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
-        )
+        _dp_nccl_env_for_create_group = {
+        }
+        with temporary_environ(_dp_nccl_env_for_create_group):
+            group_with_cp = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+            )
+            dummy = torch.ones(1, device=local_device, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                dummy,
+                group=group_with_cp,
+                async_op=False,
+            )
+
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -1453,13 +1489,41 @@ def initialize_model_parallel(
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
     if expert_gtp_remat_size > 1:
         create_gloo_process_groups = False
-    for ranks in expert_decoder_rank_generator.get_ranks("dp"):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
-            group_desc="EXPERT_DATA_PARALLEL_GROUP",
-        )
+    for ranks in expert_decoder_rank_generator.get_ranks('dp'):
+        if sharp_mode == SHARP_MODE.DISABLE_NVLINK:
+             _dp_nccl_env_for_create_group = {
+                "NCCL_MNNVL_ENABLE": "0",
+                "NCCL_NVLS_ENABLE": "0",
+                "NCCL_P2P_DISABLE": "1",
+                "NCCL_SHMEM_DISABLE": "1",
+            }
+        else:
+            _dp_nccl_env_for_create_group = {
+                "NCCL_MNNVL_ENABLE": "0",
+                "NCCL_NVLS_ENABLE": "0",
+                "NCCL_P2P_DISABLE": "1",
+                "NCCL_SHMEM_DISABLE": "1",
+                "NCCL_COLLNET_ENABLE": "1",
+                "NCCL_ALGO": "collnetdirect",
+                "SHARP_COLL_ENABLE_MCAST" :"0", 
+                "SHARP_COLL_ENABLE_SAT"     :"1",
+                "SHARP_COLL_REDUCE_SCATTER_FRAG_SIZE" : "131072",
+                "SHARP_COLL_MAX_REDUCE_OST_DEPTH" : "31",
+            }
+
+        with temporary_environ(_dp_nccl_env_for_create_group):
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+                group_desc="EXPERT_DATA_PARALLEL_GROUP",
+            )
+            dummy = torch.ones(1, device=local_device, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                dummy,
+                group=group,
+                async_op=False,
+            )
         if create_gloo_process_groups:
             group_gloo = create_group(
                 ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
@@ -1636,13 +1700,25 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         rank_offset=0,
     )
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_device = torch.device("cuda", local_rank)
+    world_size = torch.distributed.get_world_size()
+
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
+        _dp_nccl_env_for_create_group = { }
+        with temporary_environ(_dp_nccl_env_for_create_group):
+            group_with_cp_ag = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            )
+            dummy = torch.ones(1, device=local_device, dtype=torch.float32)
+            torch.distributed.all_reduce(
+                dummy,
+                group=group_with_cp_ag,
+                async_op=False,
+            )
         if rank in ranks_with_cp:
             dp_cp_ag_group = group_with_cp_ag
 
@@ -1665,12 +1741,49 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         )
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
-            )
+            if sharp_mode == SHARP_MODE.DISABLE_NVLINK:
+                _dp_nccl_env_for_create_group = {
+                    "NCCL_MNNVL_ENABLE": "0",
+                    "NCCL_NVLS_ENABLE": "0",
+                    "NCCL_P2P_DISABLE": "1",
+                    "NCCL_SHMEM_DISABLE": "1",
+                }
+            else:
+                _dp_nccl_env_for_create_group = {
+                    "NCCL_MNNVL_ENABLE": "0",
+                    "NCCL_NVLS_ENABLE": "0",
+                    "NCCL_P2P_DISABLE": "1",
+                    "NCCL_SHMEM_DISABLE": "1",
+                    "NCCL_COLLNET_ENABLE": "1",
+                    "NCCL_ALGO": "collnetdirect",
+                    "SHARP_COLL_ENABLE_MCAST" :"1", 
+                    "SHARP_COLL_ENABLE_SAT"     :"0",
+                    "SHARP_COLL_JOB_REQUEST_MC" : "1",
+                    "SHARP_COLL_ALLGATHER_ALG"  : "5",
+                    "SHARP_COLL_ALLGATHER_OFFSET_FALLBACK_TO_ALG4" : "1",
+                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_SIZE" : "32768",
+                    "SHARP_COLL_MCAST_ALLGATHER_NUM_POSTS" : "2",
+                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_PROGRESS_MODE" : "0",
+                    "SHARP_COLL_NUM_MCAST_TREES" : "1",
+                    "SHARP_COLL_USE_DEVX" : "0",
+                    "SHARP_COLL_PLANE_MASK" : "15",
+                }
+
+            with temporary_environ(_dp_nccl_env_for_create_group):
+                expert_dp_ag = create_group(
+                        expert_dp_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                        group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                    )
+                dummy_input_ag  = torch.ones(1, device=local_device)
+                dummy_output_ag = [torch.empty_like(dummy_input_ag) for _ in range(world_size)]
+                torch.distributed.all_gather(
+                    dummy_output_ag,
+                    dummy_input_ag,
+                    group=expert_dp_ag,
+                    async_op=False
+                ) 
             if rank in expert_dp_ranks:
                 expt_dp_ag_group = expert_dp_ag
 
