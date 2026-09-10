@@ -24,7 +24,11 @@ class SHARP_MODE (Enum):
     DISABLE_NVLINK            = 0
     DISABLE_NVLINK_WITH_SHARP = 1
 
-sharp_mode : SHARP_MODE = SHARP_MODE.DISABLE_NVLINK_WITH_SHARP
+sharp_mode : SHARP_MODE = (
+    SHARP_MODE.DISABLE_NVLINK_WITH_SHARP
+    if os.environ.get("QWEN_ENABLE_SHARP", "0") == "1"
+    else SHARP_MODE.DISABLE_NVLINK
+)
 
 @contextmanager
 def temporary_environ(updates: Mapping[str, str]) -> Iterator[None]:
