@@ -1495,24 +1495,26 @@ def initialize_model_parallel(
         create_gloo_process_groups = False
     for ranks in expert_decoder_rank_generator.get_ranks('dp'):
         if sharp_mode == SHARP_MODE.DISABLE_NVLINK:
-             _dp_nccl_env_for_create_group = {
-                "NCCL_MNNVL_ENABLE": "0",
-                "NCCL_NVLS_ENABLE": "0",
-                "NCCL_P2P_DISABLE": "1",
-                "NCCL_SHMEM_DISABLE": "1",
+            print("SHENG-DEBUG:no-sharp")
+            _dp_nccl_env_for_create_group = {
+                # "NCCL_MNNVL_ENABLE": "0",
+                # "NCCL_NVLS_ENABLE": "0",
+                # "NCCL_P2P_DISABLE": "1",
+                # "NCCL_SHMEM_DISABLE": "1",
             }
         else:
+            print("SHENG-DEBUG: sharp enabled")
             _dp_nccl_env_for_create_group = {
-                "NCCL_MNNVL_ENABLE": "0",
-                "NCCL_NVLS_ENABLE": "0",
-                "NCCL_P2P_DISABLE": "1",
-                "NCCL_SHMEM_DISABLE": "1",
+                # "NCCL_MNNVL_ENABLE": "0",
+                # "NCCL_NVLS_ENABLE": "0",
+                # "NCCL_P2P_DISABLE": "1",
+                # "NCCL_SHMEM_DISABLE": "1",
                 "NCCL_COLLNET_ENABLE": "1",
                 "NCCL_ALGO": "collnetdirect",
                 "SHARP_COLL_ENABLE_MCAST" :"0", 
                 "SHARP_COLL_ENABLE_SAT"     :"1",
-                "SHARP_COLL_REDUCE_SCATTER_FRAG_SIZE" : "131072",
-                "SHARP_COLL_MAX_REDUCE_OST_DEPTH" : "31",
+                # "SHARP_COLL_REDUCE_SCATTER_FRAG_SIZE" : "131072",
+                # "SHARP_COLL_MAX_REDUCE_OST_DEPTH" : "31",
             }
 
         with temporary_environ(_dp_nccl_env_for_create_group):
@@ -1746,31 +1748,35 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
             if sharp_mode == SHARP_MODE.DISABLE_NVLINK:
+                print("SHENG-DEBUG:no-sharp")
                 _dp_nccl_env_for_create_group = {
-                    "NCCL_MNNVL_ENABLE": "0",
-                    "NCCL_NVLS_ENABLE": "0",
-                    "NCCL_P2P_DISABLE": "1",
-                    "NCCL_SHMEM_DISABLE": "1",
+                    # "NCCL_MNNVL_ENABLE": "0",
+                    # "NCCL_NVLS_ENABLE": "0",
+                    # "NCCL_P2P_DISABLE": "1",
+                    # "NCCL_SHMEM_DISABLE": "1",
                 }
             else:
+                print("SHENG-DEBUG: sharp enabled")
                 _dp_nccl_env_for_create_group = {
-                    "NCCL_MNNVL_ENABLE": "0",
-                    "NCCL_NVLS_ENABLE": "0",
-                    "NCCL_P2P_DISABLE": "1",
-                    "NCCL_SHMEM_DISABLE": "1",
+                    # "NCCL_MNNVL_ENABLE": "0",
+                    # "NCCL_NVLS_ENABLE": "0",
+                    # "NCCL_P2P_DISABLE": "1",
+                    # "NCCL_SHMEM_DISABLE": "1",
                     "NCCL_COLLNET_ENABLE": "1",
                     "NCCL_ALGO": "collnetdirect",
-                    "SHARP_COLL_ENABLE_MCAST" :"1", 
-                    "SHARP_COLL_ENABLE_SAT"     :"0",
-                    "SHARP_COLL_JOB_REQUEST_MC" : "1",
-                    "SHARP_COLL_ALLGATHER_ALG"  : "5",
-                    "SHARP_COLL_ALLGATHER_OFFSET_FALLBACK_TO_ALG4" : "1",
-                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_SIZE" : "32768",
-                    "SHARP_COLL_MCAST_ALLGATHER_NUM_POSTS" : "2",
-                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_PROGRESS_MODE" : "0",
-                    "SHARP_COLL_NUM_MCAST_TREES" : "1",
-                    "SHARP_COLL_USE_DEVX" : "0",
-                    "SHARP_COLL_PLANE_MASK" : "15",
+                    "SHARP_COLL_ENABLE_MCAST": "1",
+                    "SHARP_COLL_ENABLE_SAT": "0",
+                    "SHARP_COLL_ALLGATHER_ALG": "5",
+                    "SHARP_COLL_ALLGATHER_OFFSET_FALLBACK_TO_ALG4": "0",
+                    "SHARP_COLL_JOB_NUM_TREES": "4",
+                    "SHARP_COLL_GROUPS_PER_COMM": "4",
+                    "SHARP_COLL_PLANE_MASK": "15",
+                    "SHARP_COLL_NUM_MCAST_TREES": "4",
+                    "SHARP_COLL_JOB_REQUEST_MC": "1",
+                    "SHARP_COLL_JOB_QUOTA_OSTS": "1",
+                    "SHARP_COLL_OSTS_PER_GROUP": "1",
+                    "SHARP_COLL_JOB_QUOTA_PAYLOAD_PER_OST": "128",
+                    "SHARP_COLL_MCAST_ALLGATHER_MAX_INFLIGHT": "4",
                 }
 
             with temporary_environ(_dp_nccl_env_for_create_group):
