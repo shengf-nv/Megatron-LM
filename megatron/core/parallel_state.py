@@ -1495,7 +1495,7 @@ def initialize_model_parallel(
         create_gloo_process_groups = False
     for ranks in expert_decoder_rank_generator.get_ranks('dp'):
         if sharp_mode == SHARP_MODE.DISABLE_NVLINK:
-             _dp_nccl_env_for_create_group = {
+            _dp_nccl_env_for_create_group = {
                 "NCCL_MNNVL_ENABLE": "0",
                 "NCCL_NVLS_ENABLE": "0",
                 "NCCL_P2P_DISABLE": "1",
