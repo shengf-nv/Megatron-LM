@@ -1512,7 +1512,7 @@ def initialize_model_parallel(
                 "SHARP_COLL_ENABLE_MCAST" :"0", 
                 "SHARP_COLL_ENABLE_SAT"     :"1",
                 "SHARP_COLL_REDUCE_SCATTER_FRAG_SIZE" : "131072",
-                "SHARP_COLL_MAX_REDUCE_OST_DEPTH" : "31",
+                #"SHARP_COLL_MAX_REDUCE_OST_DEPTH" : "31",
             }
 
         with temporary_environ(_dp_nccl_env_for_create_group):
@@ -1765,12 +1765,12 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
                     "SHARP_COLL_JOB_REQUEST_MC" : "1",
                     "SHARP_COLL_ALLGATHER_ALG"  : "5",
                     "SHARP_COLL_ALLGATHER_OFFSET_FALLBACK_TO_ALG4" : "1",
-                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_SIZE" : "32768",
-                    "SHARP_COLL_MCAST_ALLGATHER_NUM_POSTS" : "2",
-                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_PROGRESS_MODE" : "0",
-                    "SHARP_COLL_NUM_MCAST_TREES" : "1",
-                    "SHARP_COLL_USE_DEVX" : "0",
-                    "SHARP_COLL_PLANE_MASK" : "15",
+                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_SIZE" : "131072",
+                    "SHARP_COLL_MCAST_ALLGATHER_NUM_POSTS" : "1",
+                    "SHARP_COLL_MCAST_ALLGATHER_CHUNK_PROGRESS_MODE" : "1",
+                    "SHARP_COLL_NUM_MCAST_TREES" : "6",
+                    # "SHARP_COLL_USE_DEVX" : "0",
+                    # "SHARP_COLL_PLANE_MASK" : "15",
                 }
 
             with temporary_environ(_dp_nccl_env_for_create_group):
